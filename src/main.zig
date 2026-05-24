@@ -1,4 +1,5 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const posix = std.posix;
 const build_options = @import("build_options");
 const ghostty_vt = @import("ghostty-vt");
@@ -13,6 +14,7 @@ const compat = @import("compat.zig");
 
 pub const version = build_options.version;
 pub const ghostty_version = build_options.ghostty_version;
+pub const git_sha = build_options.git_sha;
 
 var log_system = log.LogSystem{};
 
@@ -1887,8 +1889,8 @@ fn fetchHistory(
     };
     defer alloc.free(socket_path);
 
-    var dir = try std.fs.openDirAbsolute(cfg.socket_dir, .{});
-    defer dir.close();
+    var dir = try std.Io.Dir.openDirAbsolute(std.Options.debug_io, cfg.socket_dir, .{});
+    defer dir.close(std.Options.debug_io);
 
     const exists = try socket.sessionExists(dir, session_name);
     if (!exists) {
@@ -1899,7 +1901,7 @@ fn fetchHistory(
         if (err == error.ConnectionRefused) socket.cleanupStaleSocket(dir, session_name);
         return err;
     };
-    defer posix.close(fd);
+    defer compat.close(fd);
 
     const format_byte: u8 = @intFromEnum(util.HistoryFormat.plain);
     const payload = [_]u8{format_byte};
