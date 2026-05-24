@@ -25,6 +25,7 @@ pub fn build(b: *std.Build) void {
 
     const options = b.addOptions();
     options.addOption([]const u8, "version", version);
+    options.addOption([]const u8, "git_sha", git_sha);
     const ghostty_ver = @import("build.zig.zon").dependencies.ghostty.hash;
     options.addOption([]const u8, "ghostty_version", ghostty_ver);
 
@@ -83,7 +84,6 @@ pub fn build(b: *std.Build) void {
             .use_llvm = true,
             .use_lld = true,
         });
-        exe_unit_tests.linkLibC();
         const run_exe_unit_tests = b.addRunArtifact(exe_unit_tests);
         test_step.dependOn(&run_exe_unit_tests.step);
     }
