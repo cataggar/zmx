@@ -48,7 +48,7 @@ jobs:
           echo "SOURCE_DATE_EPOCH=$SDE" >> "$GITHUB_ENV"
 
       - name: Build
-        run: zig build -Doptimize=ReleaseSafe -Dtarget=${{ matrix.target }} -Dstrip=true "-Dversion=${{ steps.version.outputs.version }}"
+        run: zig build -Doptimize=ReleaseSafe -Dtarget=${{ matrix.target }} "-Dversion=${{ steps.version.outputs.version }}"
 
       - name: Package
         shell: bash
