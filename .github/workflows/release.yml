@@ -66,9 +66,7 @@ jobs:
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: ${{ matrix.name }}
-          path: |
-            zmx-*.tar.gz
-            zmx-*.tar.gz.sha256
+          path: zmx-*.tar.gz
 
   release:
     name: Create Release
@@ -121,12 +119,11 @@ jobs:
 
             Linux binaries (musl, statically linked).
 
-            Each archive has companion `.sha256` and `.sigstore.json`
-            (keyless cosign bundle) sidecars. Build provenance is
-            attested via GitHub Artifact Attestations.
+            Each archive has a companion `.sigstore.json` keyless cosign
+            bundle. Build provenance is attested via GitHub Artifact
+            Attestations.
           files: |
             zmx-*.tar.gz
-            zmx-*.tar.gz.sha256
             zmx-*.sigstore.json
           draft: false
           prerelease: ${{ contains(steps.version.outputs.version, '-') }}

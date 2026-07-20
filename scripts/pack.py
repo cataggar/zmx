@@ -12,9 +12,6 @@ byte-reproducible across runs and runners:
 * the gzip header carries ``mtime=0`` and no original filename;
 * gzip compression level is fixed (level 9).
 
-Also writes a ``<archive>.sha256`` sidecar in the ``sha256sum``-compatible
-``HEX  FILENAME\n`` format.
-
 Usage: pack.py <pkgdir> <archive.tar.gz>
 
 ``SOURCE_DATE_EPOCH`` is read from the environment (decimal seconds since
@@ -23,7 +20,6 @@ the Unix epoch). Required.
 from __future__ import annotations
 
 import gzip
-import hashlib
 import io
 import os
 import sys
@@ -86,13 +82,6 @@ def main(argv: list[str]) -> int:
         ) as gz:
             gz.write(buf.getvalue())
 
-    with open(archive, "rb") as fh:
-        digest = hashlib.sha256(fh.read()).hexdigest()
-    sidecar = archive + ".sha256"
-    with open(sidecar, "w", encoding="utf-8", newline="\n") as fh:
-        fh.write(f"{digest}  {os.path.basename(archive)}\n")
-
-    print(f"{digest}  {os.path.basename(archive)}")
     return 0
 
 
