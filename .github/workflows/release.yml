@@ -126,4 +126,5 @@ jobs:
             zmx-*.tar.gz
             zmx-*.sigstore.json
           draft: false
-          prerelease: ${{ contains(steps.version.outputs.version, '-') }}
+          prerelease: false
+          make_latest: true
