@@ -1,0 +1,25 @@
+name: CI
+
+on:
+  push:
+    branches: [main, zig16]
+  pull_request:
+    branches: [main, zig16]
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.16.0
+
+      - name: Build
+        run: zig build --summary all
+
+      - name: Run unit tests
+        run: zig build test --summary all
