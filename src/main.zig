@@ -1023,7 +1023,10 @@ const Daemon = struct {
             const saved_prompt_redraw = term.flags.shell_redraws_prompt;
             term.flags.shell_redraws_prompt = .false;
             defer term.flags.shell_redraws_prompt = saved_prompt_redraw;
-            try term.resize(self.alloc, resize.cols, resize.rows);
+            try term.resize(self.alloc, .{
+                .cols = resize.cols,
+                .rows = resize.rows,
+            });
 
             // Mark that we've had a client init, so subsequent clients get terminal state
             self.has_had_client = true;
@@ -1059,7 +1062,10 @@ const Daemon = struct {
         const saved_prompt_redraw = term.flags.shell_redraws_prompt;
         term.flags.shell_redraws_prompt = .false;
         defer term.flags.shell_redraws_prompt = saved_prompt_redraw;
-        try term.resize(self.alloc, resize.cols, resize.rows);
+        try term.resize(self.alloc, .{
+            .cols = resize.cols,
+            .rows = resize.rows,
+        });
         std.log.debug("resize rows={d} cols={d}", .{ resize.rows, resize.cols });
     }
 
@@ -1537,7 +1543,7 @@ fn tail(client_socket_fds: std.ArrayList(i32), detached: bool, is_run_cmd: bool)
         if (task_complete_code) |exit_code| {
             // Flush any remaining output before returning
             flush_loop: while (stdout_buf.items.len > 0) {
-                const n = posix.write(posix.STDOUT_FILENO, stdout_buf.items) catch |err| {
+                const n = compat.write(posix.STDOUT_FILENO, stdout_buf.items) catch |err| {
                     if (err == error.WouldBlock) break :flush_loop;
                     return err;
                 };
