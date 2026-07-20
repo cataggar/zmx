@@ -115,13 +115,11 @@ jobs:
         with:
           name: zmx ${{ steps.version.outputs.version }}
           body: |
-            zmx ${{ steps.version.outputs.version }}
+            Install with [ghr](https://cataggar.github.io/ghr/):
 
-            Linux binaries (musl, statically linked).
-
-            Each archive has a companion `.sigstore.json` keyless cosign
-            bundle. Build provenance is attested via GitHub Artifact
-            Attestations.
+            ```sh
+            ghr install cataggar/zmx@${{ github.ref_name }}
+            ```
           files: |
             zmx-*.tar.gz
             zmx-*.sigstore.json
