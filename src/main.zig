@@ -2570,12 +2570,10 @@ fn daemonLoop(daemon: *Daemon, server_sock_fd: i32, pty_fd: i32) !void {
     defer poll_fds.deinit(daemon.alloc);
 
     const init_size = ipc.getTerminalSize(pty_fd);
-    var env_map = std.process.Environ.Map.init(daemon.alloc);
-    defer env_map.deinit();
-    var term = try ghostty_vt.Terminal.init(daemon.alloc, std.Options.debug_io, &env_map, .{
+    var term = try ghostty_vt.Terminal.init(std.Options.debug_io, daemon.alloc, .{
         .cols = init_size.cols,
         .rows = init_size.rows,
-        .max_scrollback = daemon.cfg.max_scrollback,
+        .max_scrollback_bytes = daemon.cfg.max_scrollback,
     });
     defer term.deinit(daemon.alloc);
     var vt_stream = term.vtStream();
