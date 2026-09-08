@@ -7,6 +7,7 @@ from pathlib import Path
 import pty
 import select
 import shlex
+import signal
 import socket
 import struct
 import subprocess
@@ -77,7 +78,8 @@ class Terminal:
     def finished(self, code):
         # Keep draining the PTY while the child flushes its final output.
         eventually(lambda: (self.read(), self.process.poll() is not None)[1])
-        self.read()
+        while select.select([self.master], [], [], 0.05)[0]:
+            self.read()
         error = self.process.stderr.read()
         assert self.process.returncode == code, (self.process.returncode, error, self.output)
         assert termios.tcgetattr(self.slave) == self.original, "termios not restored"
@@ -239,6 +241,59 @@ def race():
                     assert not select.select([replacement], [], [], 0.1)[0], "client reconnected"
     assert_no_spawn("race")
     path.unlink()
+
+
+def closing_restore():
+    env = install_spawn_trap()
+    restored = b"\x1b[31m" + b"restored-state-" * 357 + b"\x1b[0m"
+    assert len(restored) > 4096
+
+    def frame(tag, payload):
+        return bytes([tag]) + len(payload).to_bytes(4, sys.byteorder) + b"\0" * 3 + payload
+
+    for command, acknowledged in (
+        ("resume", True), ("resume", False), ("attach", True), ("attach", False),
+    ):
+        name = f"{command}-{acknowledged}"
+        path = ROOT / name
+        with socket.socket(socket.AF_UNIX) as server:
+            server.bind(str(path))
+            server.listen(4)
+            server.settimeout(TIMEOUT)
+            with terminal(command, name, env=env) as client:
+                if command == "attach":
+                    probe, _ = server.accept()
+                    with probe:
+                        probe.settimeout(TIMEOUT)
+                        assert probe.recv(1) == b"", "attach did not close its existing-session probe"
+                connection, _ = server.accept()
+                with connection:
+                    connection.settimeout(TIMEOUT)
+                    assert read_message(connection)[0] == 7
+                    assert read_message(connection) == (6, b"")
+                    # Queue the whole restoration and EOF before the next poll,
+                    # deterministically exercising simultaneous POLLIN/POLLHUP.
+                    os.kill(client.process.pid, signal.SIGSTOP)
+                    _, status = os.waitpid(client.process.pid, os.WUNTRACED)
+                    assert os.WIFSTOPPED(status)
+                    try:
+                        data = frame(1, restored)
+                        if acknowledged:
+                            data += frame(6, bytes(552))
+                        connection.sendall(data)
+                        connection.shutdown(socket.SHUT_RDWR)
+                        connection.close()
+                    finally:
+                        os.kill(client.process.pid, signal.SIGCONT)
+                expected_code = 1 if command == "resume" and not acknowledged else 0
+                error = client.finished(expected_code)
+                assert client.output == b"\x1b[2J\x1b[H" + restored + b"\x1bc", client.output
+                if expected_code == 1:
+                    assert b"SessionUnavailable" in error
+                else:
+                    assert not error, error
+        assert_no_spawn(name)
+        path.unlink()
 
 
 def switching():

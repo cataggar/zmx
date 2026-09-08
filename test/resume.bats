@@ -97,6 +97,11 @@ PY
   [ "$status" -eq 0 ]
 }
 
+@test "resume and attach: drain large restoration and Info through daemon EOF" {
+  run python3 "$BATS_TEST_DIRNAME/resume_pty.py" "$ZMX" closing_restore
+  [ "$status" -eq 0 ]
+}
+
 @test "resume: switching stays non-creating; nested resume is rejected; attach still creates" {
   run python3 "$BATS_TEST_DIRNAME/resume_pty.py" "$ZMX" switching
   [ "$status" -eq 0 ]

@@ -2516,6 +2516,8 @@ fn clientLoop(client_sock_fd: i32) !ClientResult {
     // EOF, including when an empty session has nothing to restore.
     try ipc.appendMessage(alloc, &sock_write_buf, .Info, "");
     var ready = false;
+    var socket_eof = false;
+    var socket_write_open = true;
 
     var poll_fds = try std.ArrayList(posix.pollfd).initCapacity(alloc, 4);
     defer poll_fds.deinit(alloc);
@@ -2535,22 +2537,31 @@ fn clientLoop(client_sock_fd: i32) !ClientResult {
     _ = try compat.fcntl(stdin_fd, posix.F.SETFL, stdin_orig_flags | O_NONBLOCK);
     defer _ = compat.fcntl(stdin_fd, posix.F.SETFL, stdin_orig_flags) catch {};
 
+    // stdout may be a separate pipe rather than the same terminal description
+    // as stdin. Keep partial-output draining responsive in either case.
+    const stdout_orig_flags = try compat.fcntl(posix.STDOUT_FILENO, posix.F.GETFL, 0);
+    _ = try compat.fcntl(posix.STDOUT_FILENO, posix.F.SETFL, stdout_orig_flags | O_NONBLOCK);
+    defer _ = compat.fcntl(posix.STDOUT_FILENO, posix.F.SETFL, stdout_orig_flags) catch {};
+
     while (true) {
+        if (socket_eof and stdout_buf.items.len == 0) {
+            return ClientResult{ .kind = if (ready) .detach else .unavailable, .session_name = null };
+        }
         poll_fds.clearRetainingCapacity();
 
         try poll_fds.append(alloc, .{
-            .fd = stdin_fd,
+            .fd = if (socket_eof or !socket_write_open) -1 else stdin_fd,
             .events = posix.POLL.IN,
             .revents = 0,
         });
 
         // Poll socket for read, and also for write if we have pending data
         var sock_events: i16 = posix.POLL.IN;
-        if (sock_write_buf.items.len > 0) {
+        if (socket_write_open and sock_write_buf.items.len > 0) {
             sock_events |= posix.POLL.OUT;
         }
         try poll_fds.append(alloc, .{
-            .fd = client_sock_fd,
+            .fd = if (socket_eof) -1 else client_sock_fd,
             .events = sock_events,
             .revents = 0,
         });
@@ -2567,15 +2578,23 @@ fn clientLoop(client_sock_fd: i32) !ClientResult {
 
         _ = try posix.poll(poll_fds.items, -1);
 
+        const socket_events = poll_fds.items[1].revents;
+        if (socket_events & posix.POLL.NVAL != 0) return error.InvalidSocket;
+        if (socket_events & (posix.POLL.HUP | posix.POLL.ERR) != 0) {
+            socket_write_open = false;
+        }
+
         if (poll_fds.items[2].revents & posix.POLL.IN != 0) {
             drainSignalPipe();
-            const next_size = ipc.getTerminalSize(posix.STDOUT_FILENO);
-            try ipc.appendMessage(alloc, &sock_write_buf, .Resize, std.mem.asBytes(&next_size));
+            if (socket_write_open and !socket_eof) {
+                const next_size = ipc.getTerminalSize(posix.STDOUT_FILENO);
+                try ipc.appendMessage(alloc, &sock_write_buf, .Resize, std.mem.asBytes(&next_size));
+            }
         }
 
         // Handle stdin -> socket (Input)
         const inp_flags = (posix.POLL.IN | posix.POLL.HUP | posix.POLL.ERR | posix.POLL.NVAL);
-        if (poll_fds.items[0].revents & inp_flags != 0) {
+        if (socket_write_open and poll_fds.items[0].revents & inp_flags != 0) {
             var buf: [4096]u8 = undefined;
             const n_opt: ?usize = posix.read(stdin_fd, &buf) catch |err| blk: {
                 if (err == error.WouldBlock) break :blk null;
@@ -2597,19 +2616,20 @@ fn clientLoop(client_sock_fd: i32) !ClientResult {
             }
         }
 
-        // Handle socket read (incoming Output messages from daemon)
-        if (poll_fds.items[1].revents & posix.POLL.IN != 0) {
-            const n = read_buf.read(client_sock_fd) catch |err| {
-                if (err == error.WouldBlock) continue;
+        // HUP can accompany more than one read's worth of restoration/Info.
+        // Read at most one chunk per poll iteration, but only finish at EOF.
+        if (socket_events & (posix.POLL.IN | posix.POLL.HUP | posix.POLL.ERR) != 0) {
+            const n: ?usize = read_buf.read(client_sock_fd) catch |err| blk: {
+                if (err == error.WouldBlock) break :blk null;
                 if (err == error.ConnectionResetByPeer or err == error.BrokenPipe) {
-                    return ClientResult{ .kind = if (ready) .detach else .unavailable, .session_name = null };
+                    break :blk 0;
                 }
                 std.log.err("daemon read err={s}", .{@errorName(err)});
                 return err;
             };
             if (n == 0) {
-                // Server closed connection
-                return ClientResult{ .kind = if (ready) .detach else .unavailable, .session_name = null };
+                socket_eof = true;
+                socket_write_open = false;
             }
 
             while (read_buf.next()) |msg| {
@@ -2623,6 +2643,7 @@ fn clientLoop(client_sock_fd: i32) !ClientResult {
                         }
                     },
                     .Resize => {
+                        if (!socket_write_open) continue;
                         // daemon is asking for the client's window size usually in response
                         // to this client being set as leader.
                         const next_size = ipc.getTerminalSize(posix.STDOUT_FILENO);
@@ -2642,12 +2663,14 @@ fn clientLoop(client_sock_fd: i32) !ClientResult {
         }
 
         // Handle socket write (flush buffered messages to daemon)
-        if (poll_fds.items[1].revents & posix.POLL.OUT != 0) {
+        if (socket_write_open and socket_events & posix.POLL.OUT != 0) {
             if (sock_write_buf.items.len > 0) {
-                const n = compat.write(client_sock_fd, sock_write_buf.items) catch |err| blk: {
+                const n: usize = compat.write(client_sock_fd, sock_write_buf.items) catch |err| blk: {
                     if (err == error.WouldBlock) break :blk 0;
                     if (err == error.ConnectionResetByPeer or err == error.BrokenPipe) {
-                        return ClientResult{ .kind = if (ready) .detach else .unavailable, .session_name = null };
+                        // The peer may still have buffered Output/Info to read.
+                        socket_write_open = false;
+                        break :blk 0;
                     }
                     return err;
                 };
@@ -2665,10 +2688,6 @@ fn clientLoop(client_sock_fd: i32) !ClientResult {
             if (n > 0) {
                 try stdout_buf.replaceRange(alloc, 0, n, &[_]u8{});
             }
-        }
-
-        if (poll_fds.items[1].revents & (posix.POLL.HUP | posix.POLL.ERR | posix.POLL.NVAL) != 0) {
-            return ClientResult{ .kind = if (ready) .detach else .unavailable, .session_name = null };
         }
     }
 }
