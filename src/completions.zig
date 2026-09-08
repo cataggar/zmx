@@ -32,7 +32,7 @@ const bash_completions =
     \\  cur="${COMP_WORDS[COMP_CWORD]}"
     \\  prev="${COMP_WORDS[COMP_CWORD-1]}"
     \\
-    \\  local commands="attach run send print write detach list kill history wait tail completions version help"
+    \\  local commands="attach resume capabilities run send print write detach list kill history wait tail completions version help"
     \\
     \\  if [[ $COMP_CWORD -eq 1 ]]; then
     \\    COMPREPLY=($(compgen -W "$commands" -- "$cur"))
@@ -40,7 +40,7 @@ const bash_completions =
     \\  fi
     \\
     \\  case "$prev" in
-    \\    attach|run|send|print|write|kill|history|wait|tail)
+    \\    attach|resume|run|send|print|write|kill|history|wait|tail)
     \\      local sessions=$(zmx list --short 2>/dev/null | tr '\n' ' ')
     \\      COMPREPLY=($(compgen -W "$sessions" -- "$cur"))
     \\      ;;
@@ -75,6 +75,8 @@ const zsh_completions =
     \\      local -a commands
     \\      commands=(
     \\        'attach:Attach to session, creating if needed'
+    \\        'resume:Attach to existing session without creating'
+    \\        'capabilities:Print machine-readable capabilities'
     \\        'run:Send command without attaching'
     \\        'send:Send raw input to session PTY'
     \\        'print:Inject text into session display'
@@ -93,7 +95,7 @@ const zsh_completions =
     \\      ;;
     \\    args)
     \\      case $words[2] in
-    \\        attach|a|kill|k|run|r|send|s|print|p|write|wr|history|hi|wait|w|tail|t)
+    \\        attach|a|resume|kill|k|run|r|send|s|print|p|write|wr|history|hi|wait|w|tail|t)
     \\          _zmx_sessions
     \\          ;;
     \\        completions|c)
@@ -133,6 +135,8 @@ const fish_completions =
     \\
     \\# zmx subcommands
     \\complete -c zmx -n "__fish_is_nth_token 1" -a attach -d 'Attach to session, creating if needed'
+    \\complete -c zmx -n "__fish_is_nth_token 1" -a resume -d 'Attach to existing session without creating'
+    \\complete -c zmx -n "__fish_is_nth_token 1" -a capabilities -d 'Print machine-readable capabilities'
     \\complete -c zmx -n "__fish_is_nth_token 1" -a run -d 'Send command without attaching'
     \\complete -c zmx -n "__fish_is_nth_token 1" -a send -d 'Send raw input to session PTY'
     \\complete -c zmx -n "__fish_is_nth_token 1" -a print -d 'Inject text into session display'
@@ -148,7 +152,7 @@ const fish_completions =
     \\complete -c zmx -n "__fish_is_nth_token 1" -a help -d 'Show help message'
     \\
     \\# Complete session names and shells
-    \\complete -c zmx -n "__fish_is_nth_token 2; and __fish_seen_subcommand_from a attach r run s send p print wr write hi history" -a '(zmx list --short 2>/dev/null)' -d 'Session name'
+    \\complete -c zmx -n "__fish_is_nth_token 2; and __fish_seen_subcommand_from a attach resume r run s send p print wr write hi history" -a '(zmx list --short 2>/dev/null)' -d 'Session name'
     \\complete -c zmx -n "not __fish_is_nth_token 1; and __fish_seen_subcommand_from k kill w wait t tail" -a '(zmx list --short 2>/dev/null)' -d 'Session name'
     \\
     \\complete -c zmx -n "__fish_is_nth_token 2; and __fish_seen_subcommand_from c completions" -a 'bash zsh fish nu' -d Shell
@@ -175,6 +179,12 @@ const nu_completions =
     \\    name: string@"nu-complete zmx sessions"
     \\    ...rest: string
     \\]
+    \\
+    \\export extern "zmx resume" [
+    \\    name: string@"nu-complete zmx sessions"
+    \\]
+    \\
+    \\export extern "zmx capabilities" []
     \\
     \\export extern "zmx run" [
     \\    name: string@"nu-complete zmx sessions"

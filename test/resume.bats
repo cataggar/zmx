@@ -1,0 +1,108 @@
+#!/usr/bin/env bats
+
+load test_helper
+
+@test "capabilities: exact response without configuration, logs, sockets, or stdin" {
+  local untouched="$BATS_TEST_TMPDIR/untouched"
+  run env ZMX_DIR="$untouched" HOME="$untouched" XDG_STATE_HOME="$untouched" \
+    "$ZMX" capabilities
+  [ "$status" -eq 0 ]
+  [ "$output" = $'zmx-capabilities-v1\nresume' ]
+  [ ! -e "$untouched" ]
+
+  python3 - "$ZMX" "$untouched" <<'PY'
+import os
+import subprocess
+import sys
+
+with subprocess.Popen(
+    [sys.argv[1], "capabilities"], env=dict(os.environ, ZMX_DIR=sys.argv[2]),
+    stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+) as process:
+    # Keep stdin open: discovery must exit without trying to consume it.
+    assert process.wait(timeout=3) == 0
+    assert process.stdout.read() == b"zmx-capabilities-v1\nresume\n"
+    assert process.stderr.read() == b""
+PY
+
+  for arg in resume --help unknown; do
+    run env ZMX_DIR="$untouched" "$ZMX" capabilities "$arg"
+    [ "$status" -eq 2 ]
+    [[ "$output" != *"zmx-capabilities-v1"* ]]
+    [ ! -e "$untouched" ]
+  done
+}
+
+@test "capabilities: unknown commands are not evidence of support" {
+  run "$ZMX" unknown-command
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"Usage:"* ]]
+  [[ "$output" != $'zmx-capabilities-v1\nresume' ]]
+  run "$ZMX" list --short
+  [ -z "$output" ]
+}
+
+@test "resume: requires exactly one name, not a shell command" {
+  run "$ZMX" resume
+  [ "$status" -eq 2 ]
+  run "$ZMX" resume ""
+  [ "$status" -eq 2 ]
+  run "$ZMX" resume work sh
+  [ "$status" -eq 2 ]
+  run "$ZMX" resume ../work
+  [ "$status" -eq 1 ]
+  run "$ZMX" resume "$(printf '%200s' x)"
+  [ "$status" -eq 1 ]
+  run "$ZMX" list --short
+  [ -z "$output" ]
+}
+
+@test "resume: help and all completion scripts describe the operation" {
+  run "$ZMX" resume --help
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"resume <name>"* ]]
+  [[ "$output" == *"capabilities"* ]]
+  for shell in bash zsh fish nu; do
+    run "$ZMX" completions "$shell"
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"resume"* ]]
+    [[ "$output" == *"capabilities"* ]]
+  done
+}
+
+@test "resume: bash completion offers the command and existing session names" {
+  run bash -c '
+    eval "$("$1" completions bash)"
+    zmx() { if [[ "$*" == "list --short" ]]; then printf "work\nother\n"; else return 1; fi; }
+    COMP_WORDS=(zmx res); COMP_CWORD=1; _zmx_completions
+    [[ "${COMPREPLY[*]}" == "resume" ]] || exit 1
+    COMP_WORDS=(zmx resume wo); COMP_CWORD=2; _zmx_completions
+    [[ "${COMPREPLY[*]}" == "work" ]]
+  ' bash "$ZMX"
+  [ "$status" -eq 0 ]
+}
+
+@test "resume: restores terminal state, interacts, shares clients, and detaches" {
+  run python3 "$BATS_TEST_DIRNAME/resume_pty.py" "$ZMX" interaction
+  [ "$status" -eq 0 ]
+}
+
+@test "resume: missing, non-socket, and refused sockets never spawn or unlink" {
+  run python3 "$BATS_TEST_DIRNAME/resume_pty.py" "$ZMX" absent
+  [ "$status" -eq 0 ]
+}
+
+@test "resume: daemon disappearance during initialization fails on the retained socket" {
+  run python3 "$BATS_TEST_DIRNAME/resume_pty.py" "$ZMX" race
+  [ "$status" -eq 0 ]
+}
+
+@test "resume: switching stays non-creating; nested resume is rejected; attach still creates" {
+  run python3 "$BATS_TEST_DIRNAME/resume_pty.py" "$ZMX" switching
+  [ "$status" -eq 0 ]
+}
+
+@test "resume: session prefixes and socket-directory isolation are preserved" {
+  run python3 "$BATS_TEST_DIRNAME/resume_pty.py" "$ZMX" directories
+  [ "$status" -eq 0 ]
+}

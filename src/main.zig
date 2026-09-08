@@ -90,6 +90,16 @@ pub fn main(init: std.process.Init.Minimal) !void {
     defer args.deinit();
     _ = args.skip(); // skip program name
 
+    const parsed_command = args.next();
+    // Capability discovery must not create directories, open logs, or contact
+    // a daemon. Exact output, not exit status, distinguishes it from old help.
+    if (parsed_command) |cmd| {
+        if (std.mem.eql(u8, cmd, "capabilities")) {
+            if (args.next() != null) cliUsageError("usage: zmx capabilities");
+            return printCapabilities();
+        }
+    }
+
     var cfg = try Cfg.init(alloc);
     defer cfg.deinit(alloc);
 
@@ -98,7 +108,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
     try log_system.init(alloc, log_path, cfg.log_mode);
     defer log_system.deinit();
 
-    const cmd = args.next() orelse {
+    const cmd = parsed_command orelse {
         return list(&cfg, false);
     };
 
@@ -142,6 +152,26 @@ pub fn main(init: std.process.Init.Minimal) !void {
         const sesh = try socket.getSeshName(alloc, session_name orelse sesh_env);
         defer alloc.free(sesh);
         return history(&cfg, sesh, format);
+    } else if (std.mem.eql(u8, cmd, "resume")) {
+        const session_name = args.next() orelse cliUsageError("usage: zmx resume <name>");
+        if (args.next() != null or session_name.len == 0) cliUsageError("usage: zmx resume <name>");
+        if (std.mem.eql(u8, session_name, "--help") or std.mem.eql(u8, session_name, "-h")) {
+            return help();
+        }
+        // The legacy name-only Switch request can reach an older, creating
+        // client. Never delegate resume through it.
+        if (socket.getSeshNameFromEnv().len > 0) {
+            cliUsageError("resume must be run outside a zmx session; detach first");
+        }
+        resumeSession(&cfg, session_name) catch |err| {
+            var buf: [4096]u8 = undefined;
+            var w = std.Io.File.stderr().writer(std.Options.debug_io, &buf);
+            w.interface.print("error: session \"{s}\" unavailable for resume ({s}); no session created\n", .{
+                session_name, @errorName(err),
+            }) catch {};
+            w.interface.flush() catch {};
+            std.process.exit(1);
+        };
     } else if (std.mem.eql(u8, cmd, "attach") or std.mem.eql(u8, cmd, "a")) {
         const session_name = args.next() orelse "";
         if (std.mem.eql(u8, session_name, "--help") or std.mem.eql(u8, session_name, "-h")) {
@@ -1288,6 +1318,21 @@ fn printCompletions(shell: completions.Shell) !void {
     try w.interface.flush();
 }
 
+fn cliUsageError(message: []const u8) noreturn {
+    var buf: [512]u8 = undefined;
+    var w = std.Io.File.stderr().writer(std.Options.debug_io, &buf);
+    w.interface.print("error: {s}\n", .{message}) catch {};
+    w.interface.flush() catch {};
+    std.process.exit(2);
+}
+
+fn printCapabilities() !void {
+    var buf: [128]u8 = undefined;
+    var w = std.Io.File.stdout().writer(std.Options.debug_io, &buf);
+    try w.interface.writeAll("zmx-capabilities-v1\nresume\n");
+    try w.interface.flush();
+}
+
 fn help() !void {
     const help_text =
         \\zmx - session persistence for terminal processes
@@ -1296,6 +1341,8 @@ fn help() !void {
         \\
         \\Commands:
         \\  [a]ttach <name> [command...]             Attach to session, creating if needed
+        \\  resume <name>                           Attach to an existing session; never create
+        \\  capabilities                            Print machine-readable capabilities
         \\  [r]un <name> [-d] [command...]           Send command without attaching
         \\  [s]end <name> <text...>                  Send raw input to session PTY
         \\  [p]rint <name> <text...>                 Inject text into session display
@@ -1317,6 +1364,25 @@ fn help() !void {
         \\  Examples:
         \\    zmx attach dev
         \\    zmx attach dev vim
+        \\
+        \\Resume:
+        \\  Connect once to an existing session and restore its terminal state.
+        \\  Missing, stale, or disappearing sessions fail without creating a session.
+        \\  Switches received by a resumed client also only connect to existing sessions.
+        \\  Run outside zmx (detach first); in-session resume is rejected because the
+        \\  legacy switch protocol can reach an older client that creates sessions.
+        \\  No command arguments are accepted. Prefix and socket-directory rules apply.
+        \\  Exit 0 after attachment and detach/session end; 1 on connection, setup, or
+        \\  pre-attachment disconnect failure; 2 for usage errors or in-session resume.
+        \\  A name may refer to a replacement independently created by another actor.
+        \\
+        \\  Example: zmx resume dev
+        \\
+        \\Capabilities:
+        \\  `zmx capabilities` accepts no arguments and has no filesystem/session effects.
+        \\  Its exact stdout is two newline-terminated lines: zmx-capabilities-v1, resume.
+        \\  Require both exit 0 and this response; old unknown commands may print help
+        \\  and exit 0. Do not fall back to attach when resume is unavailable.
         \\
         \\History:
         \\  This should generally be used with `tail` to print the last lines
@@ -2047,6 +2113,73 @@ fn attach(daemon: *Daemon) !void {
 
     const client_sock = try socket.sessionConnect(daemon.socket_path);
     std.log.info("attached session={s}", .{daemon.session_name});
+    const looper = try attachConnected(client_sock);
+    switch (looper.kind) {
+        .detach, .unavailable => return,
+        .switch_session => {
+            if (looper.session_name) |session_name| {
+                defer daemon.alloc.free(session_name);
+                var cwd_buf: [std.fs.max_path_bytes]u8 = undefined;
+                const cwd = getCwd(&cwd_buf);
+                const target_path = socket.getSocketPath(
+                    daemon.alloc,
+                    daemon.cfg.socket_dir,
+                    session_name,
+                ) catch |err| switch (err) {
+                    error.NameTooLong => return socket.printSessionNameTooLong(
+                        session_name,
+                        daemon.cfg.socket_dir,
+                    ),
+                    error.OutOfMemory => return err,
+                };
+
+                const clients = try std.ArrayList(*Client).initCapacity(daemon.alloc, 10);
+                var target_daemon = Daemon{
+                    .running = true,
+                    .cfg = daemon.cfg,
+                    .alloc = daemon.alloc,
+                    .clients = clients,
+                    .session_name = session_name,
+                    .socket_path = target_path,
+                    .pid = undefined,
+                    .cwd = cwd,
+                    .created_at = @intCast(std.Io.Timestamp.now(std.Options.debug_io, .real).toSeconds()),
+                    .leader_client_fd = null,
+                };
+                return attach(&target_daemon);
+            }
+        },
+    }
+}
+
+fn resumeSession(cfg: *Cfg, session_name: []const u8) !void {
+    const alloc = std.heap.c_allocator;
+    var name = try socket.getSeshName(alloc, session_name);
+    defer alloc.free(name);
+
+    while (true) {
+        // Switch payloads already include the prefix. Validate without adding
+        // it again, and never reenter attach/ensureSession from this loop.
+        try socket.validateSeshName(name);
+        const path = try socket.getSocketPath(alloc, cfg.socket_dir, name);
+        defer alloc.free(path);
+        const fd = try socket.sessionConnect(path);
+        const result = try attachConnected(fd);
+        switch (result.kind) {
+            .detach => return,
+            .unavailable => return error.SessionUnavailable,
+            .switch_session => {
+                alloc.free(name);
+                name = result.session_name.?;
+            },
+        }
+    }
+}
+
+/// Owns the already-connected descriptor, including terminal-setup failures.
+/// Both entry points use the same terminal restoration and client protocol.
+fn attachConnected(client_sock: i32) !ClientResult {
+    defer compat.close(client_sock);
     //  This is typically used with tcsetattr() to modify terminal settings.
     //      - you first get the current settings with tcgetattr()
     //      - modify the desired attributes in the termios structure
@@ -2093,42 +2226,7 @@ fn attach(daemon: *Daemon) !void {
     const clear_seq = "\x1b[2J\x1b[H";
     _ = try compat.write(posix.STDOUT_FILENO, clear_seq);
 
-    const looper = try clientLoop(client_sock);
-    switch (looper.kind) {
-        .detach => return,
-        .switch_session => {
-            if (looper.session_name) |session_name| {
-                var cwd_buf: [std.fs.max_path_bytes]u8 = undefined;
-                const cwd = getCwd(&cwd_buf);
-                const target_path = socket.getSocketPath(
-                    daemon.alloc,
-                    daemon.cfg.socket_dir,
-                    session_name,
-                ) catch |err| switch (err) {
-                    error.NameTooLong => return socket.printSessionNameTooLong(
-                        session_name,
-                        daemon.cfg.socket_dir,
-                    ),
-                    error.OutOfMemory => return err,
-                };
-
-                const clients = try std.ArrayList(*Client).initCapacity(daemon.alloc, 10);
-                var target_daemon = Daemon{
-                    .running = true,
-                    .cfg = daemon.cfg,
-                    .alloc = daemon.alloc,
-                    .clients = clients,
-                    .session_name = session_name,
-                    .socket_path = target_path,
-                    .pid = undefined,
-                    .cwd = cwd,
-                    .created_at = @intCast(std.Io.Timestamp.now(std.Options.debug_io, .real).toSeconds()),
-                    .leader_client_fd = null,
-                };
-                return attach(&target_daemon);
-            }
-        },
-    }
+    return clientLoop(client_sock);
 }
 
 fn writeFile(daemon: *Daemon, file_path: []const u8) !void {
@@ -2378,6 +2476,7 @@ fn run(daemon: *Daemon, detached: bool, command_args: [][]const u8) !void {
 const ClientResult = struct {
     kind: enum {
         detach,
+        unavailable,
         switch_session,
     },
     session_name: ?[]const u8,
@@ -2388,10 +2487,17 @@ const ClientResult = struct {
 fn clientLoop(client_sock_fd: i32) !ClientResult {
     // use c_allocator to avoid "reached unreachable code" panic in DebugAllocator when forking
     const alloc = std.heap.c_allocator;
-    defer compat.close(client_sock_fd);
 
     try openSignalPipe();
+    var old_winch: posix.Sigaction = undefined;
+    posix.sigaction(posix.SIG.WINCH, null, &old_winch);
     installWakeHandler(posix.SIG.WINCH);
+    defer {
+        posix.sigaction(posix.SIG.WINCH, &old_winch, null);
+        compat.close(sig_pipe[0]);
+        compat.close(sig_pipe[1]);
+        sig_pipe = .{ -1, -1 };
+    }
 
     // Make socket non-blocking to avoid blocking on writes
     var sock_flags = try compat.fcntl(client_sock_fd, posix.F.GETFL, 0);
@@ -2405,6 +2511,11 @@ fn clientLoop(client_sock_fd: i32) !ClientResult {
     // Send init message with terminal size (buffered)
     const size = ipc.getTerminalSize(posix.STDOUT_FILENO);
     try ipc.appendMessage(alloc, &sock_write_buf, .Init, std.mem.asBytes(&size));
+    // Info is supported by existing daemons and ordered after Init on this
+    // same connection. Its response distinguishes attachment from an early
+    // EOF, including when an empty session has nothing to restore.
+    try ipc.appendMessage(alloc, &sock_write_buf, .Info, "");
+    var ready = false;
 
     var poll_fds = try std.ArrayList(posix.pollfd).initCapacity(alloc, 4);
     defer poll_fds.deinit(alloc);
@@ -2481,7 +2592,7 @@ fn clientLoop(client_sock_fd: i32) !ClientResult {
                     }
                 } else {
                     // EOF on stdin
-                    return ClientResult{ .kind = .detach, .session_name = null };
+                    return ClientResult{ .kind = if (ready) .detach else .unavailable, .session_name = null };
                 }
             }
         }
@@ -2491,18 +2602,21 @@ fn clientLoop(client_sock_fd: i32) !ClientResult {
             const n = read_buf.read(client_sock_fd) catch |err| {
                 if (err == error.WouldBlock) continue;
                 if (err == error.ConnectionResetByPeer or err == error.BrokenPipe) {
-                    return ClientResult{ .kind = .detach, .session_name = null };
+                    return ClientResult{ .kind = if (ready) .detach else .unavailable, .session_name = null };
                 }
                 std.log.err("daemon read err={s}", .{@errorName(err)});
                 return err;
             };
             if (n == 0) {
                 // Server closed connection
-                return ClientResult{ .kind = .detach, .session_name = null };
+                return ClientResult{ .kind = if (ready) .detach else .unavailable, .session_name = null };
             }
 
             while (read_buf.next()) |msg| {
                 switch (msg.header.tag) {
+                    .Info => {
+                        if (msg.payload.len == @sizeOf(ipc.Info)) ready = true;
+                    },
                     .Output => {
                         if (msg.payload.len > 0) {
                             try stdout_buf.appendSlice(alloc, msg.payload);
@@ -2533,7 +2647,7 @@ fn clientLoop(client_sock_fd: i32) !ClientResult {
                 const n = compat.write(client_sock_fd, sock_write_buf.items) catch |err| blk: {
                     if (err == error.WouldBlock) break :blk 0;
                     if (err == error.ConnectionResetByPeer or err == error.BrokenPipe) {
-                        return ClientResult{ .kind = .detach, .session_name = null };
+                        return ClientResult{ .kind = if (ready) .detach else .unavailable, .session_name = null };
                     }
                     return err;
                 };
@@ -2554,7 +2668,7 @@ fn clientLoop(client_sock_fd: i32) !ClientResult {
         }
 
         if (poll_fds.items[1].revents & (posix.POLL.HUP | posix.POLL.ERR | posix.POLL.NVAL) != 0) {
-            return ClientResult{ .kind = .detach, .session_name = null };
+            return ClientResult{ .kind = if (ready) .detach else .unavailable, .session_name = null };
         }
     }
 }
