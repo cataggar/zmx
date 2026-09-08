@@ -61,7 +61,7 @@ load test_helper
 }
 
 @test "subcommands handle --help and -h without side effects" {
-  for cmd in attach send print write kill wait tail history list completions; do
+  for cmd in attach resume send print write kill wait tail history list completions; do
     run "$ZMX" "$cmd" --help
     [ "$status" -eq 0 ]
     [[ "$output" == *"Usage:"* ]]

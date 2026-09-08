@@ -66,6 +66,17 @@ Be sure to add `~/.local/bin` to your `PATH`:
 zig build -Doptimize=ReleaseSafe --prefix ~/.local
 ```
 
+### tests
+
+Run `zig build test` for unit tests. With Bats, Python 3, Bash, and `timeout`
+installed, run `zig build && bats test` for the real session/PTY integration
+tests. These isolate their sockets and logs from running sessions. The
+`resume.bats` cases cover terminal restoration, multiple clients, switching,
+non-creation on missing/stale sockets, and deterministic daemon disappearance.
+If the test directory exceeds the OS Unix-socket path limit, set
+`ZMX_TEST_SOCKET_ROOT` to an existing, empty directory with a shorter absolute
+path; each test creates its own socket directory beneath it.
+
 ## usage
 
 > [!IMPORTANT]
@@ -78,6 +89,8 @@ Usage: zmx <command> [args...]
 
 Commands:
   [a]ttach <name> [command...]             Attach to session, creating if needed
+  resume <name>                           Attach to an existing session; never create
+  capabilities                            Print machine-readable capabilities
   [r]un <name> [-d] [command...]           Send command without attaching
   [s]end <name> <text...>                  Send raw input to session PTY
   [p]rint <name> <text...>                 Inject text into session display
@@ -92,6 +105,63 @@ Commands:
   [v]ersion                                Show version and metadata (socket dir, log dir)
   [h]elp                                   Show this help
 ```
+
+### resume without creating a session
+
+Use `zmx resume work` for automatic reconnection when a missing session must
+not be replaced with a new shell. Unlike `attach`, `resume` connects once to
+the named socket and keeps that connection for attachment and terminal-state
+restoration. It does not list or probe and then call `attach`. It never
+creates a daemon or shell, removes stale sockets, or retries a failed
+connection. `ZMX_SESSION_PREFIX` and the normal socket-directory rules apply.
+It accepts exactly one name and no command arguments.
+
+| Exit | Meaning |
+| --- | --- |
+| `0` | Attached successfully, then detached or the session ended. |
+| `1` | Connection/setup failed, or the daemon disconnected before confirming attachment. A missing, refused/stale, or disappearing socket takes this path. A diagnostic is written to stderr; no replacement is created. |
+| `2` | Incorrect arguments, or `resume` was invoked inside a zmx session. |
+
+Run `resume` outside zmx: detach first if `ZMX_SESSION` is set. An in-session
+invocation is deliberately rejected, because the legacy name-only switch
+protocol could ask an older outer client to create a session. Once connected
+via `resume`, the outer client also uses non-creating connections for every
+subsequent session-switch request (including requests sent by an in-session
+`attach`). An unavailable switch target exits with `1`; it is not created.
+Ordinary clients started with `attach` retain their upsert behavior.
+
+This guarantees non-creation, not session identity: another actor may
+independently replace a daemon under the same name before the connection.
+Nor does exit `0` prove the remote shell is still alive after detachment.
+Retry policy belongs to the caller; `resume` does not retry or inject
+terminal-stream control markers.
+
+#### capability discovery
+
+`zmx capabilities` accepts no arguments, returns `0`, and writes exactly:
+
+```text
+zmx-capabilities-v1
+resume
+```
+
+Both lines end with a newline. It does not initialize configuration, create
+socket/log directories, open log files, connect to sessions, or read stdin.
+Extra arguments return `2` without a capability response. Clients must check
+both the exit code and the explicit response: older binaries may print help
+and return `0` for an unknown subcommand. For example:
+
+```sh
+if capabilities=$(zmx capabilities) &&
+   [ "$capabilities" = "$(printf 'zmx-capabilities-v1\nresume')" ]; then
+  zmx resume work
+else
+  printf '%s\n' 'non-creating resume is unavailable' >&2
+  exit 1
+fi
+```
+
+Do not fall back to `attach` if discovery or resume fails.
 
 ## shell prompt
 

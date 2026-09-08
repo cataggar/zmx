@@ -10,8 +10,15 @@ setup() {
   ZMX="$REPO_DIR/zig-out/bin/zmx"
 
   # Isolate socket dir so tests don't interfere with real sessions or each other
-  export ZMX_DIR="$BATS_TEST_TMPDIR/zmx-sockets"
-  mkdir -p "$ZMX_DIR"
+  if [[ -n "${ZMX_TEST_SOCKET_ROOT:-}" ]]; then
+    # Optional existing, empty short-path directory for long checkout paths.
+    local suite="${BATS_TEST_FILENAME##*/}"
+    export ZMX_DIR="$ZMX_TEST_SOCKET_ROOT/${suite%.bats}-$BATS_TEST_NUMBER"
+    mkdir "$ZMX_DIR"
+  else
+    export ZMX_DIR="$BATS_TEST_TMPDIR/zmx-sockets"
+    mkdir -p "$ZMX_DIR"
+  fi
 }
 
 teardown() {
