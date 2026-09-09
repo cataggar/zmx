@@ -1329,7 +1329,7 @@ fn cliUsageError(message: []const u8) noreturn {
 fn printCapabilities() !void {
     var buf: [128]u8 = undefined;
     var w = std.Io.File.stdout().writer(std.Options.debug_io, &buf);
-    try w.interface.writeAll("zmx-capabilities-v1\nresume\n");
+    try w.interface.writeAll("zmx-capabilities-v1\nresume\npreserve-scrollback\n");
     try w.interface.flush();
 }
 
@@ -1365,6 +1365,12 @@ fn help() !void {
         \\    zmx attach dev
         \\    zmx attach dev vim
         \\
+        \\Client cleanup:
+        \\  Attach/resume restore termios and ordinary primary-screen modes without
+        \\  RIS or erasing retained scrollback. Subsequent output starts on a fresh
+        \\  bottom line. This is not snapshot deduplication, protection from application
+        \\  escape sequences, session identity, or a persistent-connection guarantee.
+        \\
         \\Resume:
         \\  Connect once to an existing session and restore its terminal state.
         \\  Missing, stale, or disappearing sessions fail without creating a session.
@@ -1380,9 +1386,13 @@ fn help() !void {
         \\
         \\Capabilities:
         \\  `zmx capabilities` accepts no arguments and has no filesystem/session effects.
-        \\  Its exact stdout is two newline-terminated lines: zmx-capabilities-v1, resume.
+        \\  Its exact stdout is three newline-terminated lines:
+        \\    zmx-capabilities-v1
+        \\    resume
+        \\    preserve-scrollback
         \\  Require both exit 0 and this response; old unknown commands may print help
-        \\  and exit 0. Do not fall back to attach when resume is unavailable.
+        \\  and exit 0. Older resume clients may still erase scrollback on cleanup.
+        \\  Do not fall back to attach when required capabilities are unavailable.
         \\
         \\History:
         \\  This should generally be used with `tail` to print the last lines
@@ -2195,12 +2205,11 @@ fn attachConnected(client_sock: i32) !ClientResult {
     const stdin_is_tty = cross.c.tcgetattr(posix.STDIN_FILENO, &orig_termios) == 0;
 
     defer {
+        // Emit while output processing is still raw (in particular, no ONLCR).
+        util.cleanupClientTerminal(posix.STDOUT_FILENO);
         if (stdin_is_tty) {
             _ = cross.c.tcsetattr(posix.STDIN_FILENO, cross.c.TCSAFLUSH, &orig_termios);
         }
-        // Reset terminal modes on detach:
-        const restore_seq = "\x1bc";
-        _ = compat.write(posix.STDOUT_FILENO, restore_seq) catch {};
     }
 
     if (stdin_is_tty) {

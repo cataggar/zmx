@@ -136,16 +136,39 @@ Nor does exit `0` prove the remote shell is still alive after detachment.
 Retry policy belongs to the caller; `resume` does not retry or inject
 terminal-stream control markers.
 
-#### capability discovery
+### client cleanup and scrollback
+
+Both `attach` and `resume` clean up terminal modes without RIS (full reset) or
+primary-screen erasure. Cleanup leaves the alternate screen, disables
+bracketed paste, mouse/focus and other event reporting, synchronized output,
+Kitty keyboard stacks and xterm modifyOtherKeys. It restores normal keyboard,
+cursor, wrapping, rendition, charset, and scrolling-region settings, then
+places subsequent shell output on a fresh bottom line rather than clearing
+the display. The original termios settings are restored as before.
+
+The `preserve-scrollback` capability promises that **client cleanup does not
+erase retained primary scrollback**, subject to the terminal's normal
+scrollback limits. It does not merge alternate-screen contents into history,
+deduplicate snapshots, filter application escape sequences, identify daemon
+incarnations, or guarantee a persistent connection. Cleanup is best-effort if
+the terminal output is no longer writable; it cannot protect history from
+arbitrary applications or an older client that still emits a full reset.
+
+When invoking zmx remotely, check the remote executable's capability response:
+preserving the local terminal alone cannot prevent an older remote client
+from erasing its scrollback.
+
+### capability discovery
 
 `zmx capabilities` accepts no arguments, returns `0`, and writes exactly:
 
 ```text
 zmx-capabilities-v1
 resume
+preserve-scrollback
 ```
 
-Both lines end with a newline. It does not initialize configuration, create
+All three lines end with a newline. It does not initialize configuration, create
 socket/log directories, open log files, connect to sessions, or read stdin.
 Extra arguments return `2` without a capability response. Clients must check
 both the exit code and the explicit response: older binaries may print help
@@ -153,14 +176,16 @@ and return `0` for an unknown subcommand. For example:
 
 ```sh
 if capabilities=$(zmx capabilities) &&
-   [ "$capabilities" = "$(printf 'zmx-capabilities-v1\nresume')" ]; then
+   [ "$capabilities" = "$(printf 'zmx-capabilities-v1\nresume\npreserve-scrollback')" ]; then
   zmx resume work
 else
-  printf '%s\n' 'non-creating resume is unavailable' >&2
+  printf '%s\n' 'history-preserving, non-creating resume is unavailable' >&2
   exit 1
 fi
 ```
 
+`preserve-scrollback` is additive within the v1 framing. A client requiring an
+exact capability set may intentionally fail closed on older or unknown sets.
 Do not fall back to `attach` if discovery or resume fails.
 
 ## shell prompt

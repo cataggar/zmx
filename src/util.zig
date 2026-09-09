@@ -520,6 +520,36 @@ pub fn isUserInput(payload: []const u8) bool {
     return false;
 }
 
+const cleanup_keyboard = "\x1b[<999u\x1b[=0u\x1b[>4;0m";
+
+/// Restore an ordinary primary-screen terminal without RIS or display erasure.
+/// Kitty keyboard stacks are per screen: clear the current one before leaving
+/// alternate screen, then the primary one. DECSTR alone does not cover these
+/// modes (and is not implemented by every terminal).
+pub const client_cleanup =
+    "\x18\x1b[?2026l" ++ // Cancel an unfinished sequence and end synchronized output.
+    cleanup_keyboard ++
+    "\x1b[?1049;1047;47l" ++
+    cleanup_keyboard ++
+    "\x1b[?1;5;6;45;66;67;69;1045l" ++
+    "\x1b[?9;1000;1002;1003;1004;1005;1006;1015;1016l" ++
+    "\x1b[?2004;2031;2033;2048l" ++
+    "\x1b[2;4;20l\x1b[12h\x1b[?7;25h" ++
+    "\x1b[0m\x1b[0 q\x1b[0\"q\x1b]8;;\x1b\\" ++
+    "\x1b(B\x1b)B\x1b*B\x1b+B\x0f\x1b}" ++
+    // Resetting origin/margins homes the cursor. Put subsequent shell output on
+    // a fresh bottom line instead of overwriting retained visible text.
+    "\x1b[r\x1b[65535;1H\r\n";
+
+pub fn cleanupClientTerminal(fd: posix.fd_t) void {
+    var remaining: []const u8 = client_cleanup;
+    while (remaining.len > 0) {
+        const n = compat.write(fd, remaining) catch return;
+        if (n == 0) return;
+        remaining = remaining[n..];
+    }
+}
+
 pub fn serializeTerminalState(alloc: std.mem.Allocator, term: *ghostty_vt.Terminal) ?[]const u8 {
     var builder: std.Io.Writer.Allocating = .init(alloc);
     defer builder.deinit();
@@ -1052,6 +1082,102 @@ fn testCreateTerminal(alloc: std.mem.Allocator, cols: u16, rows: u16, vt_data: [
         stream.nextSlice(vt_data);
     }
     return term;
+}
+
+test "client cleanup preserves parsed primary history and restores terminal modes" {
+    const alloc = testing.allocator;
+    for ([_][]const u8{ "", "\x1b[?47h", "\x1b[?1047h", "\x1b[?1049h" }) |enter_alt| {
+        var term = try testCreateTerminal(alloc, 80, 8, "");
+        defer term.deinit(alloc);
+        term.setDefaultCursorStyle(.bar);
+        term.setDefaultCursorBlink(true);
+        var stream = term.vtStream();
+        defer stream.deinit();
+
+        stream.nextSlice("HISTORY_RETAINED\r\n");
+        var buf: [32]u8 = undefined;
+        for (0..40) |i| {
+            stream.nextSlice(try std.fmt.bufPrint(&buf, "LINE_{d}\r\n", .{i}));
+        }
+        const pages = &term.screens.active.pages;
+        try testing.expect(!pages.getTopLeft(.screen).eql(pages.getTopLeft(.active)));
+        const before = serializeTerminal(alloc, &term, .plain).?;
+        defer alloc.free(before);
+        try testing.expect(std.mem.indexOf(u8, before, "HISTORY_RETAINED") != null);
+
+        stream.nextSlice("\x1b[>31u\x1b[>15u");
+        stream.nextSlice(enter_alt);
+        stream.nextSlice("\x1b[>31u\x1b[>15u\x1b[>4;2m");
+        stream.nextSlice("\x1b[?1;5;6;45;66;67;69;1045h");
+        stream.nextSlice("\x1b[?9;1000;1002;1003;1004;1005;1006;1015;1016h");
+        stream.nextSlice("\x1b[?2004;2026;2031;2033;2048h");
+        stream.nextSlice("\x1b[?7;25l\x1b[2;4;20h\x1b[12l");
+        stream.nextSlice("\x1b[2;6r\x1b[3;20s\x1b[1;31m\x1b[4 q\x1b[1\"q");
+        stream.nextSlice("\x1b]8;;https://example.com\x1b\\\x1b(0\x1b)0\x0e");
+        try testing.expect(term.modes.get(.bracketed_paste));
+        try testing.expect(term.modes.get(.synchronized_output));
+        try testing.expect(term.flags.modify_other_keys_2);
+        try testing.expect(term.screens.active.kitty_keyboard.current().int() != 0);
+        stream.nextSlice("\x1b]2;unfinished"); // Cleanup must not become OSC payload.
+        stream.nextSlice(client_cleanup);
+
+        try testing.expectEqual(ghostty_vt.ScreenSet.Key.primary, term.screens.active_key);
+        inline for (.{
+            .cursor_keys,        .reverse_colors,               .origin,                             .reverse_wrap,        .keypad_keys,
+            .backarrow_key_mode, .enable_left_and_right_margin, .reverse_wrap_extended,              .mouse_event_x10,     .mouse_event_normal,
+            .mouse_event_button, .mouse_event_any,              .focus_event,                        .mouse_format_utf8,   .mouse_format_sgr,
+            .mouse_format_urxvt, .mouse_format_sgr_pixels,      .bracketed_paste,                    .synchronized_output, .report_color_scheme,
+            .report_visibility,  .in_band_size_reports,         .disable_keyboard,                   .insert,              .linefeed,
+            .alt_screen_legacy,  .alt_screen,                   .alt_screen_save_cursor_clear_enter,
+        }) |mode| try testing.expect(!term.modes.get(mode));
+        try testing.expect(term.modes.get(.wraparound));
+        try testing.expect(term.modes.get(.cursor_visible));
+        try testing.expect(term.modes.get(.cursor_blinking));
+        try testing.expect(term.modes.get(.send_receive_mode));
+        try testing.expect(!term.flags.modify_other_keys_2);
+        try testing.expectEqual(.none, term.flags.mouse_event);
+        try testing.expectEqual(.x10, term.flags.mouse_format);
+        for ([_]ghostty_vt.ScreenSet.Key{ .primary, .alternate }) |key| {
+            if (term.screens.get(key)) |screen| {
+                for (screen.kitty_keyboard.flags) |flags| try testing.expectEqual(@as(u5, 0), flags.int());
+            }
+        }
+        const cursor = &term.screens.active.cursor;
+        try testing.expectEqual(.bar, cursor.cursor_style);
+        try testing.expect(term.cursor.is_default);
+        try testing.expectEqual(@as(u16, 0), cursor.style_id);
+        try testing.expect(!cursor.protected);
+        try testing.expectEqual(@as(u32, 0), cursor.hyperlink_id);
+        try testing.expectEqual(@as(u16, 0), term.scrolling_region.top);
+        try testing.expectEqual(@as(u16, 7), term.scrolling_region.bottom);
+        try testing.expectEqual(@as(u16, 0), term.scrolling_region.left);
+        try testing.expectEqual(@as(u16, 79), term.scrolling_region.right);
+        try expectCursorAt(&term, 7, 0);
+        stream.nextSlice("ordinary qqq");
+        const after = serializeTerminal(alloc, &term, .plain).?;
+        defer alloc.free(after);
+        try testing.expect(std.mem.indexOf(u8, after, before) != null);
+        try testing.expect(std.mem.indexOf(u8, after, "ordinary qqq") != null);
+
+        // Regression control: the former cleanup really does erase this history.
+        stream.nextSlice("\x1bc");
+        const erased = serializeTerminal(alloc, &term, .plain);
+        defer if (erased) |text| alloc.free(text);
+        try testing.expect(std.mem.indexOf(u8, erased orelse "", "HISTORY_RETAINED") == null);
+    }
+}
+
+test "DECSTR alone does not leave alternate screen or reset extended input modes" {
+    const alloc = testing.allocator;
+    var term = try testCreateTerminal(alloc, 80, 8, "\x1b[?1049h\x1b[?2004;2026h\x1b[>31u");
+    defer term.deinit(alloc);
+    var stream = term.vtStream();
+    defer stream.deinit();
+    stream.nextSlice("\x1b[!p");
+    try testing.expectEqual(ghostty_vt.ScreenSet.Key.alternate, term.screens.active_key);
+    try testing.expect(term.modes.get(.bracketed_paste));
+    try testing.expect(term.modes.get(.synchronized_output));
+    try testing.expect(term.screens.active.kitty_keyboard.current().int() != 0);
 }
 
 fn expectScreensMatch(alloc: std.mem.Allocator, expected: *ghostty_vt.Terminal, actual: *ghostty_vt.Terminal) !void {

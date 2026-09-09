@@ -26,6 +26,19 @@ ENV.pop("ZMX_SESSION_PREFIX", None)
 ENV.pop("BASH_ENV", None)
 Path(ENV["HOME"]).mkdir()
 TIMEOUT = 8
+# Exact bytes are also parsed and checked for history/mode effects in util.zig.
+CLEANUP_KEYBOARD = b"\x1b[<999u\x1b[=0u\x1b[>4;0m"
+CLEANUP = (
+    b"\x18\x1b[?2026l" + CLEANUP_KEYBOARD +
+    b"\x1b[?1049;1047;47l" + CLEANUP_KEYBOARD +
+    b"\x1b[?1;5;6;45;66;67;69;1045l"
+    b"\x1b[?9;1000;1002;1003;1004;1005;1006;1015;1016l"
+    b"\x1b[?2004;2031;2033;2048l"
+    b"\x1b[2;4;20l\x1b[12h\x1b[?7;25h"
+    b"\x1b[0m\x1b[0 q\x1b[0\"q\x1b]8;;\x1b\\"
+    b"\x1b(B\x1b)B\x1b*B\x1b+B\x0f\x1b}"
+    b"\x1b[r\x1b[65535;1H\r\n"
+)
 
 
 def cli(*args, env=ENV):
@@ -86,12 +99,13 @@ class Terminal:
         flags = fcntl.fcntl(self.slave, fcntl.F_GETFL)
         # Darwin adds a kernel bookkeeping bit after any write to a PTY.
         assert flags & os.O_NONBLOCK == self.flags & os.O_NONBLOCK, "stdin left nonblocking"
+        assert self.output.endswith(CLEANUP), "history-preserving cleanup missing"
+        assert b"\x1bc" not in self.output, "destructive client reset"
         return error
 
     def detach(self):
         self.send(b"\x1c")
         self.finished(0)
-        assert b"\x1bc" in self.output, "terminal reset missing"
 
     def close(self):
         if self.process.poll() is None:
@@ -164,12 +178,18 @@ def interaction():
             second.command("printf 'live-%s\\n' second")
             first.expect(b"live-second")
             second.expect(b"live-second")
+            # Both clients must clean up a live alternate screen and input modes.
+            assert cli("print", "work", "\x1b[?1049h\x1b[?1003;1004;2004h\x1b[>31u\r\nalternate-state").returncode == 0
+            first.expect(b"alternate-state")
+            second.expect(b"alternate-state")
             first.detach()
             second.command("printf 'still-%s\\n' attached")
             second.expect(b"still-attached")
             assert cli("detach", env=dict(ENV, ZMX_SESSION="work")).returncode == 0
             second.finished(0)
     assert pid("work") == original_pid
+    assert cli("print", "work", "\x1b[?1049l").returncode == 0
+    eventually(lambda: b"restored-state" in cli("history", "work").stdout)
     with terminal("attach", "work", "/definitely-not-a-command") as client:
         client.expect(b"restored-state")
         client.detach()
@@ -287,7 +307,7 @@ def closing_restore():
                         os.kill(client.process.pid, signal.SIGCONT)
                 expected_code = 1 if command == "resume" and not acknowledged else 0
                 error = client.finished(expected_code)
-                assert client.output == b"\x1b[2J\x1b[H" + restored + b"\x1bc", client.output
+                assert client.output == b"\x1b[2J\x1b[H" + restored + CLEANUP, client.output
                 if expected_code == 1:
                     assert b"SessionUnavailable" in error
                 else:
@@ -308,6 +328,8 @@ def switching():
         client.expect(b"nested-2")
         assert pid("target") == original_pid
         client.command(f"{quoted} attach target")
+        client.expect(CLEANUP)
+        assert b"\x1bc" not in client.output, "destructive switch reset"
         client.expect(b"zmx-test> ")
         client.command("printf 'target-%s\\n' \"$ZMX_SESSION\"")
         client.expect(b"target-target")
@@ -332,6 +354,8 @@ def switching():
         client.expect(b"zmx-test> ")
         client.command(f"{quoted} attach created /bin/bash --noprofile --norc -i")
         eventually(lambda: (client.read(), (ROOT / "created").exists())[1])
+        client.expect(CLEANUP)
+        assert b"\x1bc" not in client.output, "destructive attach switch reset"
         client.command("printf 'created-%s\\n' \"$ZMX_SESSION\"")
         client.expect(b"created-created")
         client.detach()
@@ -344,6 +368,8 @@ def directories():
     with terminal("resume", "source", env=prefixed) as client:
         client.expect(b"zmx-test> ")
         client.command(f"{shlex.quote(ZMX)} attach target")
+        client.expect(CLEANUP)
+        assert b"\x1bc" not in client.output, "destructive prefixed switch reset"
         client.expect(b"zmx-test> ")
         client.command("printf 'prefix-%s\\n' \"$ZMX_SESSION\"")
         client.expect(b"prefix-p.target")

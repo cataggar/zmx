@@ -7,7 +7,7 @@ load test_helper
   run env ZMX_DIR="$untouched" HOME="$untouched" XDG_STATE_HOME="$untouched" \
     "$ZMX" capabilities
   [ "$status" -eq 0 ]
-  [ "$output" = $'zmx-capabilities-v1\nresume' ]
+  [ "$output" = $'zmx-capabilities-v1\nresume\npreserve-scrollback' ]
   [ ! -e "$untouched" ]
 
   python3 - "$ZMX" "$untouched" <<'PY'
@@ -21,7 +21,7 @@ with subprocess.Popen(
 ) as process:
     # Keep stdin open: discovery must exit without trying to consume it.
     assert process.wait(timeout=3) == 0
-    assert process.stdout.read() == b"zmx-capabilities-v1\nresume\n"
+    assert process.stdout.read() == b"zmx-capabilities-v1\nresume\npreserve-scrollback\n"
     assert process.stderr.read() == b""
 PY
 
@@ -37,7 +37,7 @@ PY
   run "$ZMX" unknown-command
   [ "$status" -eq 0 ]
   [[ "$output" == *"Usage:"* ]]
-  [[ "$output" != $'zmx-capabilities-v1\nresume' ]]
+  [[ "$output" != $'zmx-capabilities-v1\nresume\npreserve-scrollback' ]]
   run "$ZMX" list --short
   [ -z "$output" ]
 }
@@ -62,6 +62,7 @@ PY
   [ "$status" -eq 0 ]
   [[ "$output" == *"resume <name>"* ]]
   [[ "$output" == *"capabilities"* ]]
+  [[ "$output" == *"preserve-scrollback"* ]]
   for shell in bash zsh fish nu; do
     run "$ZMX" completions "$shell"
     [ "$status" -eq 0 ]
