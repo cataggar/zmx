@@ -551,6 +551,10 @@ pub fn cleanupClientTerminal(fd: posix.fd_t) void {
 }
 
 pub fn serializeTerminalState(alloc: std.mem.Allocator, term: *ghostty_vt.Terminal) ?[]const u8 {
+    return serializeTerminalStateForClient(alloc, term, term.rows);
+}
+
+pub fn serializeTerminalStateForClient(alloc: std.mem.Allocator, term: *ghostty_vt.Terminal, client_rows: u16) ?[]const u8 {
     var builder: std.Io.Writer.Allocating = .init(alloc);
     defer builder.deinit();
 
@@ -563,6 +567,7 @@ pub fn serializeTerminalState(alloc: std.mem.Allocator, term: *ghostty_vt.Termin
     if (had_synchronized_output) {
         term.modes.set(.synchronized_output, false);
     }
+    defer if (had_synchronized_output) term.modes.set(.synchronized_output, true);
 
     const pages = &term.screens.active.pages;
     const screen_top = pages.getTopLeft(.screen);
@@ -598,13 +603,26 @@ pub fn serializeTerminalState(alloc: std.mem.Allocator, term: *ghostty_vt.Termin
             scroll_fmt.extra = .none; // no modes, cursor, keyboard — just content
             scroll_fmt.format(&builder.writer) catch |err| {
                 std.log.warn("failed to format scrollback err={s}", .{@errorName(err)});
+                return null;
+            };
+        }
+
+        // The last viewport of phase 1 is still visible. Scroll it into history
+        // before clearing, using the receiving terminal's height, not the PTY's.
+        for (0..client_rows) |_| {
+            builder.writer.writeAll("\r\n") catch |err| {
+                std.log.warn("failed to scroll retained history err={s}", .{@errorName(err)});
+                return null;
             };
         }
 
         // Clear visible screen after scrollback. \x1b[2J clears only the visible
         // rows (not the scrollback buffer). \x1b[H homes the cursor. \x1b[0m resets
         // SGR style so phase 1 styles don't bleed into phase 2.
-        builder.writer.writeAll("\x1b[2J\x1b[H\x1b[0m") catch {};
+        builder.writer.writeAll("\x1b[2J\x1b[H\x1b[0m") catch |err| {
+            std.log.warn("failed to finish scrollback err={s}", .{@errorName(err)});
+            return null;
+        };
     }
 
     // Phase 2: visible screen with full extras (modes, cursor, keyboard, etc.)
@@ -647,11 +665,6 @@ pub fn serializeTerminalState(alloc: std.mem.Allocator, term: *ghostty_vt.Termin
 
     const output = builder.writer.buffered();
     if (output.len == 0) return null;
-
-    // Restore the original synchronized_output mode before returning
-    if (had_synchronized_output) {
-        term.modes.set(.synchronized_output, true);
-    }
 
     return alloc.dupe(u8, output) catch |err| {
         std.log.warn("failed to allocate terminal state err={s}", .{@errorName(err)});

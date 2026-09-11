@@ -11,6 +11,7 @@ const cross = @import("cross.zig");
 const socket = @import("socket.zig");
 const env = @import("env.zig");
 const compat = @import("compat.zig");
+const attachment = @import("attachment.zig");
 
 pub const version = build_options.version;
 pub const ghostty_version = build_options.ghostty_version;
@@ -495,6 +496,7 @@ const Client = struct {
     has_pending_output: bool = false,
     read_buf: ipc.SocketBuffer,
     write_buf: std.ArrayList(u8),
+    admission: attachment.Admission = .{},
 
     pub fn deinit(self: *Client) void {
         compat.close(self.socket_fd);
@@ -1002,33 +1004,20 @@ const Daemon = struct {
         payload: []const u8,
     ) !void {
         if (payload.len != @sizeOf(ipc.Resize)) return;
+        const resize = std.mem.bytesToValue(ipc.Resize, payload);
 
         // Serialize terminal state BEFORE resize to capture correct cursor position.
         // Resizing triggers reflow which can move the cursor, and the shell's
         // SIGWINCH-triggered redraw will run after our snapshot is sent.
-        // Only serialize on re-attach (has_had_client), not first attach, to avoid
-        // interfering with shell initialization (DA1 queries, etc.)
-        if (self.has_pty_output and self.has_had_client) {
-            const cursor = &term.screens.active.cursor;
-            std.log.debug(
-                "cursor before serialize: x={d} y={d} pending_wrap={}",
-                .{ cursor.x, cursor.y, cursor.pending_wrap },
-            );
-            if (util.serializeTerminalState(self.alloc, term)) |term_output| {
-                std.log.debug("serialize terminal state", .{});
-                // Rewrite OSC 133;A to include redraw=0 so the outer terminal
-                // does not clear prompt lines on resize (issue #111).
-                const restore_data = util.rewritePromptRedraw(self.alloc, term_output) orelse term_output;
-                defer self.alloc.free(term_output);
-                defer if (restore_data.ptr != term_output.ptr) self.alloc.free(restore_data);
-                ipc.appendMessage(self.alloc, &client.write_buf, .Output, restore_data) catch |err| {
-                    std.log.warn(
-                        "failed to buffer terminal state for client err={s}",
-                        .{@errorName(err)},
-                    );
-                };
-                client.has_pending_output = true;
-            }
+        if (try client.admission.prepareInit(
+            self.alloc,
+            &client.write_buf,
+            term,
+            self.has_pty_output,
+            self.has_had_client,
+            resize.rows,
+        )) {
+            client.has_pending_output = true;
         }
 
         // no leader is set so set one
@@ -1038,7 +1027,6 @@ const Daemon = struct {
 
         // only resize if leader
         if (self.leader_client_fd == client.socket_fd) {
-            const resize = std.mem.bytesToValue(ipc.Resize, payload);
             var ws: cross.c.struct_winsize = .{
                 .ws_row = resize.rows,
                 .ws_col = resize.cols,
@@ -1235,8 +1223,9 @@ const Daemon = struct {
         vt_stream.nextSlice(payload);
         self.has_pty_output = true;
         for (self.clients.items) |client| {
-            try ipc.appendMessage(self.alloc, &client.write_buf, .Output, payload);
-            client.has_pending_output = true;
+            if (try client.admission.output(self.alloc, &client.write_buf, payload)) {
+                client.has_pending_output = true;
+            }
         }
         if (self.clients.items.len > 0) {
             posix.kill(self.pid, posix.SIG.WINCH) catch |err| {
@@ -2519,12 +2508,11 @@ fn clientLoop(client_sock_fd: i32) !ClientResult {
 
     // Send init message with terminal size (buffered)
     const size = ipc.getTerminalSize(posix.STDOUT_FILENO);
-    try ipc.appendMessage(alloc, &sock_write_buf, .Init, std.mem.asBytes(&size));
+    try attachment.request(alloc, &sock_write_buf, size);
     // Info is supported by existing daemons and ordered after Init on this
     // same connection. Its response distinguishes attachment from an early
     // EOF, including when an empty session has nothing to restore.
-    try ipc.appendMessage(alloc, &sock_write_buf, .Info, "");
-    var ready = false;
+    var restoration: attachment.Receiver = .{};
     var socket_eof = false;
     var socket_write_open = true;
 
@@ -2554,7 +2542,7 @@ fn clientLoop(client_sock_fd: i32) !ClientResult {
 
     while (true) {
         if (socket_eof and stdout_buf.items.len == 0) {
-            return ClientResult{ .kind = if (ready) .detach else .unavailable, .session_name = null };
+            return ClientResult{ .kind = if (restoration.ready) .detach else .unavailable, .session_name = null };
         }
         poll_fds.clearRetainingCapacity();
 
@@ -2577,7 +2565,7 @@ fn clientLoop(client_sock_fd: i32) !ClientResult {
 
         try poll_fds.append(alloc, .{ .fd = sig_pipe[0], .events = posix.POLL.IN, .revents = 0 });
 
-        if (stdout_buf.items.len > 0) {
+        if (stdout_buf.items.len > 0 and restoration.canFlush(socket_eof)) {
             try poll_fds.append(alloc, .{
                 .fd = posix.STDOUT_FILENO,
                 .events = posix.POLL.OUT,
@@ -2620,7 +2608,7 @@ fn clientLoop(client_sock_fd: i32) !ClientResult {
                     }
                 } else {
                     // EOF on stdin
-                    return ClientResult{ .kind = if (ready) .detach else .unavailable, .session_name = null };
+                    return ClientResult{ .kind = if (restoration.ready) .detach else .unavailable, .session_name = null };
                 }
             }
         }
@@ -2643,14 +2631,7 @@ fn clientLoop(client_sock_fd: i32) !ClientResult {
 
             while (read_buf.next()) |msg| {
                 switch (msg.header.tag) {
-                    .Info => {
-                        if (msg.payload.len == @sizeOf(ipc.Info)) ready = true;
-                    },
-                    .Output => {
-                        if (msg.payload.len > 0) {
-                            try stdout_buf.appendSlice(alloc, msg.payload);
-                        }
-                    },
+                    .Attach, .Info, .Output => try restoration.receive(alloc, &stdout_buf, msg),
                     .Resize => {
                         if (!socket_write_open) continue;
                         // daemon is asking for the client's window size usually in response
@@ -2689,7 +2670,7 @@ fn clientLoop(client_sock_fd: i32) !ClientResult {
             }
         }
 
-        if (stdout_buf.items.len > 0) {
+        if (stdout_buf.items.len > 0 and restoration.canFlush(socket_eof)) {
             const n = compat.write(posix.STDOUT_FILENO, stdout_buf.items) catch |err| blk: {
                 if (err == error.WouldBlock) break :blk 0;
                 return err;
@@ -2873,14 +2854,14 @@ fn daemonLoop(daemon: *Daemon, server_sock_fd: i32, pty_fd: i32) !void {
                     const broadcast_data = util.rewritePromptRedraw(daemon.alloc, buf[0..n]) orelse buf[0..n];
                     defer if (broadcast_data.ptr != buf[0..n].ptr) daemon.alloc.free(broadcast_data);
                     for (daemon.clients.items) |client| {
-                        ipc.appendMessage(daemon.alloc, &client.write_buf, .Output, broadcast_data) catch |err| {
+                        const queued = client.admission.output(daemon.alloc, &client.write_buf, broadcast_data) catch |err| {
                             std.log.warn(
                                 "failed to buffer output for client err={s}",
                                 .{@errorName(err)},
                             );
                             continue;
                         };
-                        client.has_pending_output = true;
+                        if (queued) client.has_pending_output = true;
                     }
                 }
             }
@@ -2937,6 +2918,13 @@ fn daemonLoop(daemon: *Daemon, server_sock_fd: i32, pty_fd: i32) !void {
 
                 while (client.read_buf.next()) |msg| {
                     switch (msg.header.tag) {
+                        .Attach => {
+                            if (msg.payload.len == 0) {
+                                client.admission.begin();
+                            } else {
+                                std.log.warn("ignoring invalid Attach payload length={d}", .{msg.payload.len});
+                            }
+                        },
                         .Input => try daemon.handleInput(client, msg.payload),
                         .Output => try daemon.handleOutput(msg.payload, &vt_stream),
                         .Init => try daemon.handleInit(client, pty_fd, &term, msg.payload),

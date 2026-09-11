@@ -77,6 +77,11 @@ If the test directory exceeds the OS Unix-socket path limit, set
 `ZMX_TEST_SOCKET_ROOT` to an existing, empty directory with a shorter absolute
 path; each test creates its own socket directory beneath it.
 
+Select unit tests with repeatable, nonempty filters, for example
+`zig build test -Dtest-filter=attachment: -Dtest-filter=serializeTerminalState`.
+The attachment tests use in-memory IPC queues and Ghostty terminals, not
+daemons, PTYs, sockets, signals, environment changes, or login shells.
+
 ## usage
 
 > [!IMPORTANT]
@@ -135,6 +140,38 @@ independently replace a daemon under the same name before the connection.
 Nor does exit `0` prove the remote shell is still alive after detachment.
 Retry policy belongs to the caller; `resume` does not retry or inject
 terminal-stream control markers.
+
+### initial state and live output
+
+Updated clients and daemons establish a snapshot/live boundary even on the
+first attachment. Output consumed before the client connected is recovered
+from retained terminal state. Output arriving between connection and Init is
+not displayed twice: the client holds early frames, discards them at the
+boundary, then displays the snapshot and subsequent live output. The daemon
+captures the snapshot before resizing the PTY and emulator.
+Scrollback is moved past the receiving terminal's viewport before the snapshot
+clears that viewport, so the last visible portion of history is not erased.
+
+This restores retained state of the **active screen**, not an exact byte log
+or both screen buffers. It cannot recover text already erased by an
+application or evicted from scrollback, preserve unanswered terminal queries
+as a replay log, or deduplicate history from a previous connection.
+Synchronized-output mode is excluded from snapshots as before.
+
+The optional IPC `Attach` tag (`14`) has empty request and response payloads.
+Clients send `Attach`, the unchanged `Init` size, then `Info`. On `Attach` the
+daemon pauses that client's live output until Init, while continuing to
+update terminal state. Its response precedes the snapshot. Earlier frames
+are allowed to finish on the socket, including partially written frames.
+The boundary is IPC metadata, never text injected into the terminal.
+
+Silent `tail` connections and non-Init `run`, `write`, and probe clients keep
+their existing streaming behavior. Older compatible daemons ignore the
+unknown tag; their Info response releases the legacy output instead. Older
+terminal clients keep their legacy Init behavior, including its first-attach
+limitation. The improved handoff therefore requires **both** an updated client
+and daemon; replacing the executable does not upgrade already-running daemons.
+The existing capability response and resume exit codes are unchanged.
 
 ### client cleanup and scrollback
 

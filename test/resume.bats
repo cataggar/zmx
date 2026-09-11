@@ -83,6 +83,11 @@ PY
   [ "$status" -eq 0 ]
 }
 
+@test "resume: first attachment restores output consumed before any terminal Init" {
+  run python3 "$BATS_TEST_DIRNAME/resume_pty.py" "$ZMX" first_attach
+  [ "$status" -eq 0 ]
+}
+
 @test "resume: restores terminal state, interacts, shares clients, and detaches" {
   run python3 "$BATS_TEST_DIRNAME/resume_pty.py" "$ZMX" interaction
   [ "$status" -eq 0 ]

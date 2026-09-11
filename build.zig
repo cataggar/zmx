@@ -14,6 +14,10 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const is_macos = target.result.os.tag == .macos;
     const optimize = b.standardOptimizeOption(.{});
+    const test_filters = b.option([]const []const u8, "test-filter", "Run tests matching a nonempty substring (repeatable)") orelse &.{};
+    for (test_filters) |filter| {
+        if (filter.len == 0) @panic("test-filter must not be empty");
+    }
     const version = b.option([]const u8, "version", "Version string for release") orelse
         @as([]const u8, @import("build.zig.zon").version);
 
@@ -89,6 +93,7 @@ pub fn build(b: *std.Build) void {
         );
         const exe_unit_tests = b.addTest(.{
             .root_module = test_module,
+            .filters = test_filters,
             .use_llvm = true,
             .use_lld = !is_macos,
         });

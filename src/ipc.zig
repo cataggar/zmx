@@ -19,8 +19,10 @@ pub const Tag = enum(u8) {
     Switch = 11,
     Write = 12,
     TaskComplete = 13,
+    // Empty request before Init; empty response marks snapshot/live admission.
+    Attach = 14,
     // Non-exhaustive: this enum comes off the wire via bytesToValue and
-    // @enumFromInt, so out-of-range values (14-255) are representable
+    // @enumFromInt, so out-of-range values (15-255) are representable
     // rather than UB. Switches must handle `_` (unknown tag).
     _,
 };
@@ -269,7 +271,7 @@ test "Tag wire values are frozen" {
         .{ Tag.Detach, 3 }, .{ Tag.DetachAll, 4 },     .{ Tag.Kill, 5 },
         .{ Tag.Info, 6 },   .{ Tag.Init, 7 },          .{ Tag.History, 8 },
         .{ Tag.Run, 9 },    .{ Tag.Ack, 10 },          .{ Tag.Switch, 11 },
-        .{ Tag.Write, 12 }, .{ Tag.TaskComplete, 13 },
+        .{ Tag.Write, 12 }, .{ Tag.TaskComplete, 13 }, .{ Tag.Attach, 14 },
     }) |p| try std.testing.expectEqual(@as(u8, p[1]), @intFromEnum(p[0]));
 }
 

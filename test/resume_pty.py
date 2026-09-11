@@ -135,8 +135,8 @@ def create(name, env=ENV):
         client.detach()
 
 
-def pid(name):
-    listing = cli("list").stdout.decode()
+def pid(name, env=ENV):
+    listing = cli("list", env=env).stdout.decode()
     for line in listing.splitlines():
         if f"name={name}\t" in line:
             return next(field for field in line.split("\t") if field.startswith("pid="))
@@ -157,6 +157,35 @@ def assert_no_spawn(*names):
     for name in names:
         assert f"creating session={name}" not in contents, contents
         assert not (ROOT / "logs" / f"{name}.log").exists(), "fallback daemon started"
+
+
+def first_attach():
+    # `run` creates the daemon before rejecting an absent command. No Run or
+    # Init reaches it, so has_had_client remains false. Use only fixture startup
+    # files, not a login profile, and emit the marker exactly once.
+    bindir = ROOT / "fixture-bin"
+    bindir.mkdir()
+    wrapper = bindir / "bash"
+    wrapper.write_text('#!/bin/sh\nexec /bin/bash --noprofile --rcfile "$ZMX_DIR/startup.rc" -i\n')
+    wrapper.chmod(0o700)
+    (ROOT / "startup.rc").write_text("printf '\\r\\nSTARTUP_ONCE\\r\\n'\nPS1='zmx-test> '\n")
+    trap_env = install_spawn_trap()
+    env = {key: trap_env[key] for key in ("HOME", "SHELL", "TERM", "PS1", "ZMX_SESSION", "ZMX_DIR")}
+    env.update(PATH=f"{bindir}:/usr/bin:/bin", INPUTRC="/dev/null")
+    result = cli("run", "startup", env=env)
+    assert result.returncode != 0 and b"CommandRequired" in result.stderr, result
+    # History proves the daemon consumed the marker before the first terminal
+    # connected. History/Info requests do not initialize a terminal client.
+    eventually(lambda: b"STARTUP_ONCE" in cli("history", "startup", env=env).stdout)
+    original_pid = pid("startup", env=env)
+    with terminal("resume", "startup", env=env) as client:
+        client.expect(b"STARTUP_ONCE")
+        assert client.output.count(b"STARTUP_ONCE") == 1, client.output
+        client.command("printf 'input-%s\\n' accepted")
+        client.expect(b"input-accepted")
+        client.detach()
+    assert pid("startup", env=env) == original_pid
+    assert not (ROOT / "spawned").exists(), "resume launched a fallback shell"
 
 
 def interaction():
@@ -234,6 +263,13 @@ def read_message(connection):
     return header[0], read_exact(length)
 
 
+def read_init(connection):
+    assert read_message(connection) == (14, b"")
+    tag, payload = read_message(connection)
+    assert tag == 7 and len(payload) == 8, (tag, payload)
+    assert read_message(connection) == (6, b"")
+
+
 def race():
     env = install_spawn_trap()
     path = ROOT / "race"
@@ -251,10 +287,7 @@ def race():
                 with socket.socket(socket.AF_UNIX) as replacement:
                     replacement.bind(str(path))
                     replacement.listen(4)
-                    tag, payload = read_message(connection)
-                    assert tag == 7 and len(payload) == 8, (tag, payload)
-                    tag, payload = read_message(connection)
-                    assert tag == 6 and payload == b"", (tag, payload)
+                    read_init(connection)
                     connection.shutdown(socket.SHUT_RDWR)
                     error = client.finished(1)
                     assert b"SessionUnavailable" in error
@@ -289,8 +322,7 @@ def closing_restore():
                 connection, _ = server.accept()
                 with connection:
                     connection.settimeout(TIMEOUT)
-                    assert read_message(connection)[0] == 7
-                    assert read_message(connection) == (6, b"")
+                    read_init(connection)
                     # Queue the whole restoration and EOF before the next poll,
                     # deterministically exercising simultaneous POLLIN/POLLHUP.
                     os.kill(client.process.pid, signal.SIGSTOP)
