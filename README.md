@@ -152,6 +152,16 @@ captures the snapshot before resizing the PTY and emulator.
 Scrollback is moved past the receiving terminal's viewport before the snapshot
 clears that viewport, so the last visible portion of history is not erased.
 
+An unfinished VT sequence or UTF-8 character is restored after the visual
+snapshot, before live bytes, using Ghostty's replay-safe parser continuation.
+This omits effects already committed to the snapshot (such as a newline
+inside an unfinished CSI). The daemon does not wait for a sequence to finish.
+Continuation tracking has a separate bounded buffer capped by the configured
+scrollback byte limit. If a required continuation is unavailable, or snapshot
+or reply allocation fails, setup rejects only that client without a readiness
+reply; the session and other clients remain alive. Tracking can recover when
+subsequent output reaches parser ground. There is no automatic retry.
+
 This restores retained state of the **active screen**, not an exact byte log
 or both screen buffers. It cannot recover text already erased by an
 application or evicted from scrollback, preserve unanswered terminal queries
@@ -172,6 +182,13 @@ terminal clients keep their legacy Init behavior, including its first-attach
 limitation. The improved handoff therefore requires **both** an updated client
 and daemon; replacing the executable does not upgrade already-running daemons.
 The existing capability response and resume exit codes are unchanged.
+
+This handoff does not add reliable producer-side delivery after PTY EOF.
+The daemon still exits after that poll iteration, which can leave queued data
+unsent to a backpressured client. Client-side draining preserves complete
+frames already delivered, not bytes still queued in the daemon. EOF before
+the Info reply remains an unsuccessful attachment. A bounded daemon drain
+policy is separate work; no new timeout or shutdown budget is introduced.
 
 ### client cleanup and scrollback
 

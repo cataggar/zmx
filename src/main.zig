@@ -500,8 +500,32 @@ const Client = struct {
 
     pub fn deinit(self: *Client) void {
         compat.close(self.socket_fd);
+        self.deinitBuffers();
+    }
+
+    fn deinitBuffers(self: *Client) void {
         self.read_buf.deinit();
         self.write_buf.deinit(self.alloc);
+    }
+};
+
+const ClientInitIo = struct {
+    pty_fd: i32,
+    index: usize,
+
+    fn resize(self: ClientInitIo, size: ipc.Resize) void {
+        var ws: cross.c.struct_winsize = .{
+            .ws_row = size.rows,
+            .ws_col = size.cols,
+            .ws_xpixel = size.xpixel,
+            .ws_ypixel = size.ypixel,
+        };
+        _ = cross.c.ioctl(self.pty_fd, cross.c.TIOCSWINSZ, &ws);
+    }
+
+    fn reject(self: ClientInitIo, daemon: *Daemon, client: *Client, err: anyerror) void {
+        std.log.warn("rejecting client setup fd={d} err={s}", .{ client.socket_fd, @errorName(err) });
+        _ = daemon.closeClient(client, self.index, false);
     }
 };
 
@@ -680,7 +704,17 @@ const Daemon = struct {
         self.clients.clearRetainingCapacity();
     }
 
-    pub fn closeClient(self: *Daemon, client: *Client, i: usize, shutdown_on_last: bool) bool {
+    pub fn closeClient(self: *Daemon, client: *Client, i: usize, comptime shutdown_on_last: bool) bool {
+        return self.closeClientUsing(client, i, shutdown_on_last, compat.close);
+    }
+
+    fn closeClientUsing(
+        self: *Daemon,
+        client: *Client,
+        i: usize,
+        comptime shutdown_on_last: bool,
+        comptime close: fn (posix.fd_t) void,
+    ) bool {
         const fd = client.socket_fd;
         // leader is disconnected, remove ref and let another client claim leader on input
         if (self.leader_client_fd == client.socket_fd) {
@@ -690,7 +724,8 @@ const Daemon = struct {
             );
             self.leader_client_fd = null;
         }
-        client.deinit();
+        close(client.socket_fd);
+        client.deinitBuffers();
         self.alloc.destroy(client);
         _ = self.clients.orderedRemove(i);
         std.log.info("client disconnected fd={d} remaining={d}", .{ fd, self.clients.items.len });
@@ -996,15 +1031,42 @@ const Daemon = struct {
         return error.NoLeaderFound;
     }
 
-    pub fn handleInit(
+    /// False tells the message loop to skip the rest of this client's batch,
+    /// including Info and the socket flush. Rejection never shuts down a session.
+    fn dispatchInit(
         self: *Daemon,
         client: *Client,
-        pty_fd: i32,
         term: *ghostty_vt.Terminal,
+        stream: *const ghostty_vt.TerminalStream,
         payload: []const u8,
+        io: anytype,
+    ) bool {
+        self.handleInit(client, term, stream, payload, io) catch |err| {
+            io.reject(self, client, err);
+            return false;
+        };
+        return true;
+    }
+
+    fn dispatchInfo(self: *Daemon, client: *Client, io: anytype) bool {
+        self.handleInfo(client) catch |err| {
+            io.reject(self, client, err);
+            return false;
+        };
+        return true;
+    }
+
+    fn handleInit(
+        self: *Daemon,
+        client: *Client,
+        term: *ghostty_vt.Terminal,
+        stream: *const ghostty_vt.TerminalStream,
+        payload: []const u8,
+        io: anytype,
     ) !void {
-        if (payload.len != @sizeOf(ipc.Resize)) return;
+        if (payload.len != @sizeOf(ipc.Resize)) return error.InvalidInit;
         const resize = std.mem.bytesToValue(ipc.Resize, payload);
+        if (resize.rows == 0 or resize.cols == 0) return error.InvalidInit;
 
         // Serialize terminal state BEFORE resize to capture correct cursor position.
         // Resizing triggers reflow which can move the cursor, and the shell's
@@ -1013,6 +1075,7 @@ const Daemon = struct {
             self.alloc,
             &client.write_buf,
             term,
+            stream,
             self.has_pty_output,
             self.has_had_client,
             resize.rows,
@@ -1027,13 +1090,7 @@ const Daemon = struct {
 
         // only resize if leader
         if (self.leader_client_fd == client.socket_fd) {
-            var ws: cross.c.struct_winsize = .{
-                .ws_row = resize.rows,
-                .ws_col = resize.cols,
-                .ws_xpixel = resize.xpixel,
-                .ws_ypixel = resize.ypixel,
-            };
-            _ = cross.c.ioctl(pty_fd, cross.c.TIOCSWINSZ, &ws);
+            io.resize(resize);
             // Disable prompt_redraw before resize. The daemon's internal terminal
             // would otherwise clear prompt lines expecting the shell to redraw them,
             // but the shell's redraw goes to the PTY (forwarded to clients), not to
@@ -1284,6 +1341,145 @@ const Daemon = struct {
         );
     }
 };
+
+test "attachment: setup failures reject only the attaching client" {
+    const testing = std.testing;
+    const Observed = struct {
+        rejected: ?anyerror = null,
+        closed_fd: ?i32 = null,
+        queued_at_close: usize = 0,
+        info_at_close: bool = false,
+        resize_calls: usize = 0,
+    };
+    const MemoryIo = struct {
+        observed: *Observed,
+        index: usize,
+
+        fn resize(self: @This(), _: ipc.Resize) void {
+            self.observed.resize_calls += 1;
+        }
+
+        fn closeFd(_: posix.fd_t) void {}
+
+        fn reject(self: @This(), daemon: *Daemon, client: *Client, err: anyerror) void {
+            self.observed.rejected = err;
+            self.observed.closed_fd = client.socket_fd;
+            self.observed.queued_at_close = client.write_buf.items.len;
+            var queued: ipc.SocketBuffer = .{
+                .buf = client.write_buf,
+                .alloc = client.alloc,
+                .head = 0,
+            };
+            while (queued.next()) |msg| {
+                if (msg.header.tag == .Info) self.observed.info_at_close = true;
+            }
+            _ = daemon.closeClientUsing(client, self.index, false, closeFd);
+        }
+    };
+    var saw_serializer_failure = false;
+    var saw_queue_failure = false;
+    var saw_info_failure = false;
+    var saw_continuation_failure = false;
+    var saw_unavailable = false;
+    var saw_success = false;
+    for (0..3) |cut| {
+        for (0..if (cut == 2) @as(usize, 1) else 8) |fail_index| {
+            var source = try ghostty_vt.Terminal.init(std.Options.debug_io, testing.allocator, .{
+                .cols = 80,
+                .rows = 24,
+            });
+            defer source.deinit(testing.allocator);
+            var stream = attachment.trackedStream(testing.allocator, &source, if (cut == 2) 4 else 1024);
+            defer stream.deinit();
+            stream.nextSlice("\x1b[?2026hRETAINED");
+            if (cut == 1) stream.nextSlice("\x1b[31");
+            if (cut == 2) stream.nextSlice("\x1b[123");
+            var cfg: Cfg = .{ .socket_dir = "", .log_dir = "" };
+            var daemon: Daemon = .{
+                .cfg = &cfg,
+                .alloc = testing.allocator,
+                .clients = .empty,
+                .leader_client_fd = 101,
+                .session_name = "fixture",
+                .socket_path = "",
+                .running = true,
+                .pid = 0,
+                .has_pty_output = true,
+                .has_had_client = true,
+                .has_terminal_client = true,
+                .created_at = 0,
+            };
+            defer {
+                for (daemon.clients.items) |client| {
+                    client.deinitBuffers();
+                    testing.allocator.destroy(client);
+                }
+                daemon.clients.deinit(testing.allocator);
+                daemon.pty_write_buf.deinit(testing.allocator);
+            }
+            for ([_]i32{ 101, 102 }) |fd| {
+                const client = try testing.allocator.create(Client);
+                client.* = .{
+                    .alloc = testing.allocator,
+                    .socket_fd = fd,
+                    .read_buf = try ipc.SocketBuffer.init(testing.allocator),
+                    .write_buf = .empty,
+                };
+                try daemon.clients.append(testing.allocator, client);
+            }
+            const existing = daemon.clients.items[0];
+            try existing.write_buf.ensureTotalCapacity(testing.allocator, 4096);
+            const attaching = daemon.clients.items[1];
+            attaching.admission.begin();
+            const size: ipc.Resize = .{ .cols = 80, .rows = 24 };
+            // A later Info is in the same batch. The dispatcher must reject the
+            // client and return false before the caller can handle or flush it.
+            try ipc.appendMessage(testing.allocator, &attaching.read_buf.buf, .Info, "");
+            var failing = testing.FailingAllocator.init(testing.allocator, .{ .fail_index = fail_index });
+            daemon.alloc = failing.allocator();
+            var observed: Observed = .{};
+            const memory_io: MemoryIo = .{
+                .observed = &observed,
+                .index = 1,
+            };
+            const initialized = daemon.dispatchInit(attaching, &source, &stream, std.mem.asBytes(&size), memory_io);
+            var accepted = initialized;
+            if (initialized) {
+                const next = attaching.read_buf.next().?;
+                try testing.expectEqual(ipc.Tag.Info, next.header.tag);
+                accepted = daemon.dispatchInfo(attaching, memory_io);
+            }
+            if (accepted) {
+                saw_success = true;
+                try testing.expect(observed.rejected == null);
+                continue;
+            }
+            const failure = observed.rejected.?;
+            saw_serializer_failure = saw_serializer_failure or failure == error.TerminalRestoreFailed;
+            saw_queue_failure = saw_queue_failure or (!initialized and failure == error.OutOfMemory);
+            saw_info_failure = saw_info_failure or initialized;
+            saw_continuation_failure = saw_continuation_failure or failure == error.WriteFailed;
+            saw_unavailable = saw_unavailable or failure == error.ContinuationUnavailable;
+            try testing.expectEqual(@as(?i32, 102), observed.closed_fd);
+            if (!initialized) try testing.expectEqual(@as(usize, 0), observed.queued_at_close);
+            try testing.expect(!observed.info_at_close);
+            try testing.expectEqual(@as(usize, 0), observed.resize_calls);
+            try testing.expect(daemon.running);
+            try testing.expectEqual(@as(usize, 1), daemon.clients.items.len);
+            try testing.expectEqual(existing, daemon.clients.items[0]);
+            try testing.expectEqual(@as(?i32, 101), daemon.leader_client_fd);
+            try testing.expect(daemon.has_terminal_client and daemon.has_had_client);
+            try testing.expect(source.modes.get(.synchronized_output));
+            try testing.expect(try existing.admission.output(daemon.alloc, &existing.write_buf, "still live"));
+        }
+    }
+    try testing.expect(saw_serializer_failure);
+    try testing.expect(saw_queue_failure);
+    try testing.expect(saw_info_failure);
+    try testing.expect(saw_continuation_failure);
+    try testing.expect(saw_unavailable);
+    try testing.expect(saw_success);
+}
 
 fn printVersion(cfg: *Cfg) !void {
     var buf: [256]u8 = undefined;
@@ -2699,7 +2895,7 @@ fn daemonLoop(daemon: *Daemon, server_sock_fd: i32, pty_fd: i32) !void {
         .max_scrollback_bytes = daemon.cfg.max_scrollback,
     });
     defer term.deinit(daemon.alloc);
-    var vt_stream = term.vtStream();
+    var vt_stream = attachment.trackedStream(daemon.alloc, &term, daemon.cfg.max_scrollback);
     defer vt_stream.deinit();
 
     // Carries the tail of the previous PTY read so the task-exit marker
@@ -2797,9 +2993,8 @@ fn daemonLoop(daemon: *Daemon, server_sock_fd: i32, pty_fd: i32) !void {
                 if (n == 0) {
                     // EOF: Shell exited
                     std.log.info("shell exited pty_fd={d}", .{pty_fd});
-                    // Let the rest of this poll iteration complete so client
-                    // write buffers are flushed via the normal POLLOUT path.
-                    // On the next iteration, daemon.running will be false.
+                    // Only this iteration's POLLOUT opportunity remains. This
+                    // is not a complete drain under socket backpressure.
                     daemon.running = false;
                 } else {
                     // Feed PTY output to terminal emulator for state tracking
@@ -2927,7 +3122,12 @@ fn daemonLoop(daemon: *Daemon, server_sock_fd: i32, pty_fd: i32) !void {
                         },
                         .Input => try daemon.handleInput(client, msg.payload),
                         .Output => try daemon.handleOutput(msg.payload, &vt_stream),
-                        .Init => try daemon.handleInit(client, pty_fd, &term, msg.payload),
+                        .Init => {
+                            if (!daemon.dispatchInit(client, &term, &vt_stream, msg.payload, ClientInitIo{
+                                .pty_fd = pty_fd,
+                                .index = i,
+                            })) continue :clients_loop;
+                        },
                         .Switch => try daemon.handleSwitch(msg.payload),
                         .Resize => try daemon.handleResize(client, pty_fd, &term, msg.payload),
                         .Detach => {
@@ -2941,7 +3141,12 @@ fn daemonLoop(daemon: *Daemon, server_sock_fd: i32, pty_fd: i32) !void {
                         .Kill => {
                             break :daemon_loop;
                         },
-                        .Info => try daemon.handleInfo(client),
+                        .Info => {
+                            if (!daemon.dispatchInfo(client, ClientInitIo{
+                                .pty_fd = pty_fd,
+                                .index = i,
+                            })) continue :clients_loop;
+                        },
                         .History => try daemon.handleHistory(client, &term, msg.payload),
                         .Run => try daemon.handleRun(client, msg.payload),
                         .Ack, .TaskComplete => {},

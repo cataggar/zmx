@@ -180,10 +180,10 @@ def first_attach():
     original_pid = pid("startup", env=env)
     with terminal("resume", "startup", env=env) as client:
         client.expect(b"STARTUP_ONCE")
-        assert client.output.count(b"STARTUP_ONCE") == 1, client.output
-        client.command("printf 'input-%s\\n' accepted")
+        client.send(b"printf 'input-%s\\n' accepted\r")
         client.expect(b"input-accepted")
         client.detach()
+        assert client.output.count(b"STARTUP_ONCE") == 1, client.output
     assert pid("startup", env=env) == original_pid
     assert not (ROOT / "spawned").exists(), "resume launched a fallback shell"
 

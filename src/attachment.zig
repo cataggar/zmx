@@ -3,6 +3,14 @@ const ghostty_vt = @import("ghostty-vt");
 const ipc = @import("ipc.zig");
 const util = @import("util.zig");
 
+pub fn trackedStream(alloc: std.mem.Allocator, term: *ghostty_vt.Terminal, limit: usize) ghostty_vt.TerminalStream {
+    return .init(.{
+        .allocator = alloc,
+        .handler = term.vtHandler(),
+        .continuation_max_bytes = limit,
+    });
+}
+
 /// A connection is a legacy stream until it explicitly requests a snapshot
 /// boundary. In particular, a silent `tail` connection must keep streaming.
 pub const Admission = struct {
@@ -31,6 +39,7 @@ pub const Admission = struct {
         alloc: std.mem.Allocator,
         queue: *std.ArrayList(u8),
         term: *ghostty_vt.Terminal,
+        stream: *const ghostty_vt.TerminalStream,
         has_output: bool,
         has_had_client: bool,
         client_rows: u16,
@@ -38,6 +47,16 @@ pub const Admission = struct {
         const negotiated = self.state == .pending;
         if (self.state == .terminal) return false;
         if (!negotiated and !(has_output and has_had_client)) return false;
+
+        // The visual snapshot excludes incremental VT/UTF-8 decoding state.
+        // Ghostty exports only a bounded suffix that replays no committed work.
+        var continuation: std.Io.Writer.Allocating = .init(alloc);
+        defer continuation.deinit();
+        if (negotiated and !stream.ground()) {
+            try stream.writeContinuation(&continuation.writer);
+            try ghostty_vt.snapshot.continuation.validate(.{ .bytes = continuation.written() });
+        }
+        const suffix = continuation.written();
 
         const snapshot = if (has_output)
             util.serializeTerminalStateForClient(alloc, term, client_rows) orelse return error.TerminalRestoreFailed
@@ -51,10 +70,12 @@ pub const Admission = struct {
         // Do not remove earlier frames: a prefix may already be on the socket.
         // Reserve the complete boundary + snapshot before publishing either.
         const required = @as(usize, if (negotiated) @sizeOf(ipc.Header) else 0) +
-            if (restore) |data| @sizeOf(ipc.Header) + data.len else 0;
+            (if (restore) |data| @sizeOf(ipc.Header) + data.len else 0) +
+            (if (suffix.len > 0) @sizeOf(ipc.Header) + suffix.len else 0);
         try queue.ensureUnusedCapacity(alloc, required);
         if (negotiated) try ipc.appendMessage(alloc, queue, .Attach, "");
         if (restore) |data| try ipc.appendMessage(alloc, queue, .Output, data);
+        if (suffix.len > 0) try ipc.appendMessage(alloc, queue, .Output, suffix);
         if (negotiated) self.state = .terminal;
         return true;
     }
@@ -130,8 +151,8 @@ const Capture = struct {
         return self.admission.output(testing.allocator, &self.wire, data);
     }
 
-    fn prepare(self: *Capture, term: *ghostty_vt.Terminal, has_output: bool, had_client: bool) !bool {
-        return self.admission.prepareInit(testing.allocator, &self.wire, term, has_output, had_client, term.rows);
+    fn prepare(self: *Capture, term: *ghostty_vt.Terminal, stream: *const ghostty_vt.TerminalStream, has_output: bool, had_client: bool) !bool {
+        return self.admission.prepareInit(testing.allocator, &self.wire, term, stream, has_output, had_client, term.rows);
     }
 
     fn info(self: *Capture) !void {
@@ -200,7 +221,7 @@ test "attachment: requests boundary before unchanged Init and Info" {
 test "attachment: first snapshot includes output consumed before accept and Init" {
     var source = try terminal(24);
     defer source.deinit(testing.allocator);
-    var stream = source.vtStream();
+    var stream = trackedStream(testing.allocator, &source, 1_000_000);
     defer stream.deinit();
     stream.nextSlice("BEFORE_ACCEPT\r\n");
 
@@ -208,7 +229,7 @@ test "attachment: first snapshot includes output consumed before accept and Init
     defer capture.deinit();
     capture.admission.begin();
     try testing.expect(!try capture.publish(&stream, "BEFORE_INIT\r\n"));
-    try testing.expect(try capture.prepare(&source, true, false));
+    try testing.expect(try capture.prepare(&source, &stream, true, false));
     try capture.info();
     try testing.expect(try capture.publish(&stream, "AFTER_INIT\r\n"));
     try capture.drain(7, false);
@@ -227,7 +248,7 @@ test "attachment: partly delivered pre-Init frames are replaced without display 
     for ([_]usize{ 0, 3, 11, 4096 }) |sent| {
         var source = try terminal(24);
         defer source.deinit(testing.allocator);
-        var stream = source.vtStream();
+        var stream = trackedStream(testing.allocator, &source, 1_000_000);
         defer stream.deinit();
         stream.nextSlice("EARLIER_PREFIX\r\n");
         var capture = try Capture.init();
@@ -238,7 +259,7 @@ test "attachment: partly delivered pre-Init frames are replaced without display 
 
         capture.admission.begin();
         try testing.expect(!try capture.publish(&stream, "PENDING_SUFFIX\r\n"));
-        try testing.expect(try capture.prepare(&source, true, false));
+        try testing.expect(try capture.prepare(&source, &stream, true, false));
         try capture.info();
         try capture.drain(1, false);
         try testing.expect(capture.receiver.ready);
@@ -255,16 +276,18 @@ test "attachment: partly delivered pre-Init frames are replaced without display 
 test "attachment: empty session and repeated admission do not replay twice" {
     var source = try terminal(24);
     defer source.deinit(testing.allocator);
+    var stream = trackedStream(testing.allocator, &source, 1_000_000);
+    defer stream.deinit();
     var capture = try Capture.init();
     defer capture.deinit();
     capture.admission.begin();
     capture.admission.begin();
-    try testing.expect(try capture.prepare(&source, false, false));
+    try testing.expect(try capture.prepare(&source, &stream, false, false));
     try testing.expectEqual(@as(usize, @sizeOf(ipc.Header)), capture.wire.items.len);
     try capture.drain(1, false);
     try testing.expect(!capture.receiver.ready);
     capture.admission.begin();
-    try testing.expect(!try capture.prepare(&source, true, true));
+    try testing.expect(!try capture.prepare(&source, &stream, true, true));
     try capture.info();
     try capture.drain(1, false);
     try testing.expect(capture.receiver.ready);
@@ -303,15 +326,15 @@ test "attachment: legacy streams and probes remain independent of terminal admis
 test "attachment: legacy Init keeps its original first-attach and reattach semantics" {
     var source = try terminal(24);
     defer source.deinit(testing.allocator);
-    var stream = source.vtStream();
+    var stream = trackedStream(testing.allocator, &source, 1_000_000);
     defer stream.deinit();
     stream.nextSlice("LEGACY_STATE");
     var capture = try Capture.init();
     defer capture.deinit();
     // Regression control: the old first-attach gate omits this retained state.
-    try testing.expect(!try capture.prepare(&source, true, false));
+    try testing.expect(!try capture.prepare(&source, &stream, true, false));
     try testing.expectEqual(@as(usize, 0), capture.wire.items.len);
-    try testing.expect(try capture.prepare(&source, true, true));
+    try testing.expect(try capture.prepare(&source, &stream, true, true));
     try capture.info();
     try capture.drain(7, false);
     try testing.expect(!capture.receiver.boundary_received);
@@ -322,13 +345,13 @@ test "attachment: legacy Init keeps its original first-attach and reattach seman
 test "attachment: a second terminal's snapshot does not interrupt the first client" {
     var source = try terminal(24);
     defer source.deinit(testing.allocator);
-    var stream = source.vtStream();
+    var stream = trackedStream(testing.allocator, &source, 1_000_000);
     defer stream.deinit();
     stream.nextSlice("SHARED_HISTORY\r\n");
     var first = try Capture.init();
     defer first.deinit();
     first.admission.begin();
-    try testing.expect(try first.prepare(&source, true, false));
+    try testing.expect(try first.prepare(&source, &stream, true, false));
     try first.info();
     try first.drain(11, false);
 
@@ -340,7 +363,7 @@ test "attachment: a second terminal's snapshot does not interrupt the first clie
     second.admission.begin();
     try testing.expect(try first.publish(&stream, "DURING_INIT\r\n"));
     try testing.expect(!try second.admission.output(testing.allocator, &second.wire, "DURING_INIT\r\n"));
-    try testing.expect(try second.prepare(&source, true, true));
+    try testing.expect(try second.prepare(&source, &stream, true, true));
     try second.info();
     try first.drain(11, false);
     try second.drain(11, false);
@@ -355,7 +378,7 @@ test "attachment: a second terminal's snapshot does not interrupt the first clie
     }
 }
 
-test "attachment: legacy response and early EOF drain with bounded writes" {
+test "attachment: receiver drains fully delivered legacy response with bounded writes" {
     for ([_]bool{ false, true }) |acknowledged| {
         var capture = try Capture.init();
         defer capture.deinit();
@@ -377,7 +400,7 @@ test "attachment: legacy response and early EOF drain with bounded writes" {
 test "attachment: snapshot precedes resize and preserves scrollback exactly once" {
     var source = try terminal(8);
     defer source.deinit(testing.allocator);
-    var stream = source.vtStream();
+    var stream = trackedStream(testing.allocator, &source, 1_000_000);
     defer stream.deinit();
     var capture = try Capture.init();
     defer capture.deinit();
@@ -391,7 +414,7 @@ test "attachment: snapshot precedes resize and preserves scrollback exactly once
     capture.admission.begin();
     const before = util.serializeTerminalState(testing.allocator, &source).?;
     defer testing.allocator.free(before);
-    try testing.expect(try capture.prepare(&source, true, false));
+    try testing.expect(try capture.prepare(&source, &stream, true, false));
     try source.resize(testing.allocator, .{ .cols = 80, .rows = 5 });
     try capture.info();
     try capture.drain(13, false);
@@ -406,11 +429,11 @@ test "attachment: snapshot precedes resize and preserves scrollback exactly once
     for (0..50) |i| try expectMarker(&display, try std.fmt.bufPrint(&buf, "ROW_{d:0>2}", .{i}), 1);
 }
 
-test "attachment: large negotiated restoration drains through EOF without inventing readiness" {
+test "attachment: receiver drains fully delivered negotiated restoration without inventing readiness" {
     for ([_]bool{ false, true }) |acknowledged| {
         var source = try terminal(24);
         defer source.deinit(testing.allocator);
-        var stream = source.vtStream();
+        var stream = trackedStream(testing.allocator, &source, 1_000_000);
         defer stream.deinit();
         var buf: [80]u8 = undefined;
         for (0..200) |i| {
@@ -422,7 +445,7 @@ test "attachment: large negotiated restoration drains through EOF without invent
         var capture = try Capture.init();
         defer capture.deinit();
         capture.admission.begin();
-        try testing.expect(try capture.prepare(&source, true, false));
+        try testing.expect(try capture.prepare(&source, &stream, true, false));
         if (acknowledged) try capture.info();
         try capture.drain(29, true);
         try testing.expect(capture.receiver.boundary_received);
@@ -435,7 +458,7 @@ test "attachment: active screen modes and transient synchronization survive admi
     for ([_][]const u8{ "", "\x1b[?47h", "\x1b[?1047h", "\x1b[?1049h" }) |enter| {
         var source = try terminal(24);
         defer source.deinit(testing.allocator);
-        var stream = source.vtStream();
+        var stream = trackedStream(testing.allocator, &source, 1_000_000);
         defer stream.deinit();
         stream.nextSlice("PRIMARY_ONLY\r\n");
         stream.nextSlice(enter);
@@ -443,7 +466,7 @@ test "attachment: active screen modes and transient synchronization survive admi
         var capture = try Capture.init();
         defer capture.deinit();
         capture.admission.begin();
-        try testing.expect(try capture.prepare(&source, true, false));
+        try testing.expect(try capture.prepare(&source, &stream, true, false));
         try testing.expect(source.modes.get(.synchronized_output));
         try capture.info();
         try capture.drain(5, false);
@@ -466,7 +489,7 @@ test "attachment: snapshot flushes retained history at different client heights"
     for ([_]u16{ 4, 8, 16 }) |rows| {
         var source = try terminal(8);
         defer source.deinit(testing.allocator);
-        var stream = source.vtStream();
+        var stream = trackedStream(testing.allocator, &source, 1_000_000);
         defer stream.deinit();
         var buf: [32]u8 = undefined;
         for (0..50) |i| stream.nextSlice(try std.fmt.bufPrint(&buf, "HEIGHT_{d:0>2}\r\n", .{i}));
@@ -477,6 +500,7 @@ test "attachment: snapshot flushes retained history at different client heights"
             testing.allocator,
             &capture.wire,
             &source,
+            &stream,
             true,
             false,
             rows,
@@ -496,7 +520,7 @@ test "attachment: snapshot flushes retained history at different client heights"
 test "attachment: failed preparation leaves admission and terminal modes intact" {
     var source = try terminal(24);
     defer source.deinit(testing.allocator);
-    var stream = source.vtStream();
+    var stream = trackedStream(testing.allocator, &source, 1_000_000);
     defer stream.deinit();
     stream.nextSlice("\x1b[?2026hRETAINED");
     var capture = try Capture.init();
@@ -507,6 +531,7 @@ test "attachment: failed preparation leaves admission and terminal modes intact"
         failing.allocator(),
         &capture.wire,
         &source,
+        &stream,
         true,
         false,
         24,
@@ -518,6 +543,7 @@ test "attachment: failed preparation leaves admission and terminal modes intact"
         failing.allocator(),
         &capture.wire,
         &source,
+        &stream,
         false,
         false,
         24,
@@ -549,7 +575,7 @@ test "attachment: malformed or late boundaries cannot discard displayed data" {
 test "attachment: headless device attribute replies remain queued during admission" {
     var source = try terminal(24);
     defer source.deinit(testing.allocator);
-    var stream = source.vtStream();
+    var stream = trackedStream(testing.allocator, &source, 1_000_000);
     defer stream.deinit();
     var capture = try Capture.init();
     defer capture.deinit();
@@ -560,9 +586,138 @@ test "attachment: headless device attribute replies remain queued during admissi
     defer replies.deinit(testing.allocator);
     util.respondToDeviceAttributes(testing.allocator, &replies, queries);
     try testing.expectEqualStrings("\x1b[?62;22c\x1b[>1;10;0c", replies.items);
-    try testing.expect(try capture.prepare(&source, true, false));
+    try testing.expect(try capture.prepare(&source, &stream, true, false));
     try capture.info();
     try capture.drain(7, false);
     try testing.expect(std.mem.indexOf(u8, capture.displayed.items, "\x1b[c") == null);
     try testing.expectEqualStrings("\x1b[?62;22c\x1b[>1;10;0c", replies.items);
+}
+
+fn expectContinuation(prefix: []const u8, suffix: []const u8) !void {
+    // Cut before accept, after pre-boundary delivery, and while admission is
+    // pending. The destination remains a persistent parser across the cut.
+    for (0..3) |phase| {
+        var source = try terminal(24);
+        defer source.deinit(testing.allocator);
+        var stream = trackedStream(testing.allocator, &source, 1024);
+        defer stream.deinit();
+        var capture = try Capture.init();
+        defer capture.deinit();
+        if (phase == 2) capture.admission.begin();
+        if (phase == 0) {
+            stream.nextSlice(prefix);
+        } else {
+            _ = try capture.publish(&stream, prefix);
+            try capture.drain(3, false);
+        }
+        try testing.expect(!stream.ground());
+        capture.admission.begin();
+        try testing.expect(try capture.prepare(&source, &stream, true, false));
+        try capture.info();
+        try capture.drain(3, false);
+        try testing.expect(capture.receiver.ready);
+
+        var display = try terminal(24);
+        defer display.deinit(testing.allocator);
+        var display_stream = trackedStream(testing.allocator, &display, 1024);
+        defer display_stream.deinit();
+        for (capture.displayed.items) |byte| display_stream.next(byte);
+        try testing.expect(!display_stream.ground());
+
+        var before_buf: [1024]u8 = undefined;
+        var before: std.Io.Writer = .fixed(&before_buf);
+        try stream.writeContinuation(&before);
+        var after_buf: [1024]u8 = undefined;
+        var after: std.Io.Writer = .fixed(&after_buf);
+        try display_stream.writeContinuation(&after);
+        try testing.expectEqualSlices(u8, before.buffered(), after.buffered());
+
+        const start = capture.displayed.items.len;
+        try testing.expect(try capture.publish(&stream, suffix));
+        try capture.drain(1, false);
+        for (capture.displayed.items[start..]) |byte| display_stream.next(byte);
+        try testing.expect(stream.ground());
+        try testing.expect(display_stream.ground());
+        const expected = try source.plainString(testing.allocator);
+        defer testing.allocator.free(expected);
+        const actual = try display.plainString(testing.allocator);
+        defer testing.allocator.free(actual);
+        try testing.expectEqualStrings(expected, actual);
+        try testing.expectEqualDeep(source.screens.active.cursor.style, display.screens.active.cursor.style);
+        try testing.expectEqualDeep(source.modes, display.modes);
+        try testing.expectEqual(source.screens.active.cursor.x, display.screens.active.cursor.x);
+        try testing.expectEqual(source.screens.active.cursor.y, display.screens.active.cursor.y);
+        try testing.expectEqualStrings(source.getTitle() orelse "", display.getTitle() orelse "");
+    }
+}
+
+test "attachment: CSI continuation preserves subsequent text and rendition" {
+    try expectContinuation("READY\r\n\x1b[31", "mRED\r\n");
+    try expectContinuation("READY\r\n\x1b[38;2;12;34", ";56mRGB\r\n");
+    try expectContinuation("READY\r\n\x1b[?100", "0hLIVE\r\n");
+    // The newline already committed before Init must not replay a second time.
+    try expectContinuation("READY\r\n\x1b[3\r\n1", "mRED\r\n");
+}
+
+test "attachment: OSC continuation completes its title without printing payload" {
+    try expectContinuation("READY\r\n\x1b]2;title ", "after cut\x1b\\TEXT\r\n");
+    try expectContinuation("READY\r\n\x1b]2;title ", "after cut\x07TEXT\r\n");
+}
+
+test "attachment: UTF8 continuation preserves codepoints across Init" {
+    try expectContinuation("READY\r\n\xC2", "\xA2\r\n");
+    try expectContinuation("READY\r\n\xE2\x82", "\xAC\r\n");
+    try expectContinuation("READY\r\n\xF0", "\x9F\x98\x84\r\n");
+    try expectContinuation("READY\r\n\xF0\x9F", "\x98\x84\r\n");
+    try expectContinuation("READY\r\n\xF0\x9F\x98", "\x84\r\n");
+    try expectContinuation("READY\r\n\xE0\xA0\xF0", "\x9F\x98\x84\r\n");
+}
+
+test "attachment: unavailable continuation fails immediately and recovers at ground" {
+    var source = try terminal(24);
+    defer source.deinit(testing.allocator);
+    var stream = trackedStream(testing.allocator, &source, 4);
+    defer stream.deinit();
+    stream.nextSlice("\x1b[123");
+    try testing.expect(stream.continuation.?.broken);
+    try testing.expect(stream.continuation.?.bytes.items.len <= 4);
+    var capture = try Capture.init();
+    defer capture.deinit();
+    capture.admission.begin();
+    try testing.expectError(error.ContinuationUnavailable, capture.prepare(&source, &stream, true, false));
+    try testing.expectEqual(@as(usize, 0), capture.wire.items.len);
+    try testing.expect(!capture.receiver.ready);
+
+    // No waiting or automatic retry is involved. A later, separate admission
+    // becomes possible once ordinary PTY processing reaches ground.
+    stream.nextSlice("mALIVE\r\n");
+    try testing.expect(stream.ground());
+    try testing.expect(!stream.continuation.?.broken);
+    var later = try Capture.init();
+    defer later.deinit();
+    later.admission.begin();
+    try testing.expect(try later.prepare(&source, &stream, true, false));
+}
+
+test "attachment: producer truncation leaves receiver unavailable with unsent data" {
+    var source = try terminal(24);
+    defer source.deinit(testing.allocator);
+    var stream = trackedStream(testing.allocator, &source, 1024);
+    defer stream.deinit();
+    var buf: [80]u8 = undefined;
+    for (0..200) |i| {
+        stream.nextSlice(try std.fmt.bufPrint(&buf, "ROW_{d:0>3}_abcdefghijklmnopqrstuvwxyz0123456789\r\n", .{i}));
+    }
+    var capture = try Capture.init();
+    defer capture.deinit();
+    capture.admission.begin();
+    try testing.expect(try capture.prepare(&source, &stream, true, false));
+    try capture.info();
+    // Unlike drain(), only this prefix reaches the receiver before EOF.
+    // The daemon's current one-write EOF policy can leave the rest unsent.
+    try capture.transfer(4096, 4096, true);
+    try testing.expect(capture.wire.items.len > 0);
+    try testing.expect(capture.receiver.boundary_received);
+    try testing.expect(!capture.receiver.ready);
+    try testing.expectEqual(@as(usize, 0), capture.displayed.items.len);
 }
