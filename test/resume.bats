@@ -109,8 +109,11 @@ PY
 }
 
 @test "resume: producer EOF drains healthy client and expires stalled snapshot after five seconds" {
-  run python3 "$BATS_TEST_DIRNAME/resume_pty.py" "$ZMX" producer_drain
-  [ "$status" -eq 0 ]
+  run python3 -B "$BATS_TEST_DIRNAME/resume_pty.py" "$ZMX" producer_drain
+  [ "$status" -eq 0 ] || {
+    printf 'producer fixture status=%s\n%s\n' "$status" "$output"
+    return 1
+  }
 }
 
 @test "resume: switching stays non-creating; nested resume is rejected; attach still creates" {

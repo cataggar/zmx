@@ -349,12 +349,153 @@ def closing_restore():
         path.unlink()
 
 
+class ProducerTerminal(Terminal):
+    """Producer-only counters around the unchanged single-read implementation."""
+
+    def __init__(self, *args, **kwargs):
+        from producer_diagnostics import ReadMetrics
+        self.read_metrics = ReadMetrics()
+        self.phase_metrics = ReadMetrics()
+        super().__init__(*args, **kwargs)
+
+    def read(self):
+        self.read_metrics.checks += 1
+        self.phase_metrics.checks += 1
+        before = len(self.output)
+        result = super().read()
+        size = len(self.output) - before
+        self.read_metrics.received(size)
+        self.phase_metrics.received(size)
+        return result
+
+
+class ProducerObservation:
+    def __init__(self):
+        self.started = time.monotonic_ns()
+        self.phase_started = self.started
+        self.phase = "setup"
+        self.client = None
+        self.role = None
+        self.cleanup_phase = None
+        self.attempted = False
+        self.emitted = False
+        self.socket_send_buffer_bytes = None
+        self.snapshot_bytes = None
+        self.slow_received_bytes = None
+
+    def enter(self, phase):
+        from producer_diagnostics import PHASES, ReadMetrics
+        if phase not in PHASES:
+            raise ValueError("invalid producer observation phase")
+        self.phase = phase
+        self.phase_started = time.monotonic_ns()
+        if self.client is not None:
+            self.client.phase_metrics = ReadMetrics()
+
+    def failure(self, error, point):
+        if self.attempted:
+            return
+        self.attempted = True
+        observed = time.monotonic_ns()
+        from producer_diagnostics import FLAGS, NUMBERS, encode_failure, error_kind
+        metrics = dict.fromkeys(NUMBERS + FLAGS)
+        # Whitelist code objects, never filenames or exception messages. The
+        # innermost recognized site distinguishes a wait timeout from an assert.
+        sites = {
+            _producer_drain.__code__: "producer",
+            eventually.__code__: "wait",
+            Terminal.__init__.__code__: "terminal_init",
+            Terminal.read.__code__: "terminal_read",
+            Terminal.expect.__code__: "terminal_expect",
+            Terminal.finished.__code__: "terminal_finished",
+            Terminal.close.__code__: "terminal_close",
+        }
+        site = "other"
+        traceback = error.__traceback__
+        while traceback is not None:
+            if traceback.tb_frame.f_code in sites:
+                site = sites[traceback.tb_frame.f_code]
+                metrics["failure_line"] = traceback.tb_lineno
+            traceback = traceback.tb_next
+        metrics.update(
+            total_elapsed_ms=(observed - self.started) // 1_000_000,
+            phase_elapsed_ms=None if self.cleanup_phase else (observed - self.phase_started) // 1_000_000,
+            errno=error.errno if isinstance(error, OSError) else None,
+            socket_send_buffer_bytes=self.socket_send_buffer_bytes,
+            snapshot_bytes=self.snapshot_bytes,
+            slow_received_bytes=self.slow_received_bytes,
+        )
+        if self.client is not None:
+            output = self.client.output
+            rows = output.count(b"ROW_")
+            metrics.update(self.client.read_metrics.scalars())
+            if self.cleanup_phase is None:
+                metrics.update(self.client.phase_metrics.scalars("phase_"))
+            metrics.update(
+                captured_bytes=len(output),
+                rows_observed=rows,
+                ready_seen=b"PRODUCER_READY" in output,
+                complete_seen=b"PRODUCER_COMPLETE" in output,
+                rows_12000_observed=rows == 12000,
+                # Do not poll/wait/reap or infer liveness for diagnostics.
+                client_returncode_cached=self.client.process.returncode,
+            )
+        record = encode_failure(self.cleanup_phase or self.phase, point, error_kind(error), self.role, site, metrics)
+        sys.stderr.write(record.decode("ascii"))
+        sys.stderr.flush()
+        self.emitted = True
+
+
+@contextlib.contextmanager
+def producer_terminal(observation, role, *args, env=ENV):
+    observation.enter("starter_create" if role == "starter" else "healthy_create")
+    client = ProducerTerminal(*args, env=env)
+    observation.client = client
+    observation.role = role
+    try:
+        yield client
+    except BaseException as error:
+        observation.failure(error, "before_terminal_cleanup")
+        raise
+    finally:
+        # Use the same source-owned close operation and ordering as terminal().
+        # Cleanup timing is unobserved: breadcrumbs do not add clock probes here.
+        observation.cleanup_phase = "starter_cleanup" if role == "starter" else "healthy_cleanup"
+        try:
+            client.close()
+        except BaseException as error:
+            observation.failure(error, "terminal_cleanup")
+            raise
+        finally:
+            observation.cleanup_phase = None
+            observation.client = None
+            observation.role = None
+
+
 def producer_drain():
+    observation = ProducerObservation()
+    try:
+        _producer_drain(observation)
+    except BaseException as error:
+        # Existing assertions can contain whole terminal buffers. This fixture's
+        # CLI boundary emits only scalars, never an exception message/traceback.
+        # Failure stays nonzero even if encoding or writing the record fails.
+        try:
+            observation.failure(error, "fifo_cleanup" if observation.cleanup_phase else "operation")
+        finally:
+            if not observation.emitted:
+                raise SystemExit(2) from None  # diagnostic emission itself failed
+            raise SystemExit(130 if isinstance(error, KeyboardInterrupt) else 1) from None
+
+
+def _producer_drain(observation):
     # Only fixture-owned files and an explicit isolated Python producer are
     # used; the FIFO controls producer completion without terminal input.
     control_path = ROOT / "producer-control"
     producer_path = ROOT / "producer.py"
+    observation.enter("fifo_create")
     os.mkfifo(control_path, 0o600)
+    observation.enter("producer_source")
     producer_path.write_text(
         "import os, sys\n"
         "with open(sys.argv[1], 'rb', buffering=0) as control:\n"
@@ -365,49 +506,73 @@ def producer_drain():
         "    print('PRODUCER_COMPLETE', flush=True)\n"
         "    assert control.read(1) == b'x'\n"
     )
+    observation.enter("fifo_open")
     control = os.open(control_path, os.O_RDWR | os.O_NONBLOCK)
+    observation.enter("environment")
     trap_env = install_spawn_trap()
     env = {key: trap_env[key] for key in ("HOME", "SHELL", "TERM", "PS1", "ZMX_SESSION", "ZMX_DIR")}
     env.update(PATH="/usr/bin:/bin", INPUTRC="/dev/null")
     name = "producer-drain"
     try:
-        with terminal("attach", name, sys.executable, "-I", str(producer_path), str(control_path), env=env) as starter:
+        with producer_terminal(observation, "starter", "attach", name, sys.executable, "-I", str(producer_path), str(control_path), env=env) as starter:
+            observation.enter("starter_ready")
             starter.expect(b"PRODUCER_READY")
+            observation.enter("starter_detach")
             starter.detach()
-        with terminal("resume", name, env=env) as healthy:
+        with producer_terminal(observation, "healthy", "resume", name, env=env) as healthy:
+            observation.enter("healthy_ready")
             healthy.expect(b"PRODUCER_READY")
+            observation.enter("producer_emit")
             os.write(control, b"d")
+            observation.enter("healthy_complete")
             healthy.expect(b"PRODUCER_COMPLETE")
+            observation.enter("row_count")
             assert healthy.output.count(b"ROW_") == 12000
+            observation.enter("slow_create")
             with socket.socket(socket.AF_UNIX) as stalled:
+                observation.enter("slow_options")
                 stalled.settimeout(TIMEOUT)
                 send_buffer = stalled.getsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF)
+                observation.socket_send_buffer_bytes = send_buffer
+                observation.enter("slow_connect")
                 stalled.connect(str(ROOT / name))
 
                 def frame(tag, payload):
                     return bytes([tag]) + len(payload).to_bytes(4, sys.byteorder) + b"\0" * 3 + payload
 
+                observation.enter("slow_request")
                 stalled.sendall(
                     frame(14, b"") + frame(7, struct.pack("=HHHH", 24, 80, 0, 0)) + frame(6, b"")
                 )
+                observation.enter("slow_boundary")
                 assert read_message(stalled) == (14, b"")
+                observation.enter("slow_header")
                 header = read_exact(stalled, 8)
                 assert header[0] == 1, header
                 snapshot_bytes = int.from_bytes(header[1:5], sys.byteorder)
+                observation.snapshot_bytes = snapshot_bytes
                 # Both sockets use the kernel's default send buffer. Reject a
                 # host unsuitable for this fixture instead of silently passing
                 # without pressure; the expiry log additionally proves unsent
                 # producer data, rather than assuming pressure from size alone.
+                observation.enter("snapshot_size")
                 assert snapshot_bytes > 2 * send_buffer, (snapshot_bytes, send_buffer)
                 ended = time.monotonic()
                 deadline = ended + TIMEOUT
+                observation.enter("producer_finish")
                 os.write(control, b"x")
+                observation.enter("healthy_finish")
                 healthy.finished(0)
+                observation.enter("healthy_finish_time")
                 assert time.monotonic() - ended < 5, "healthy client waited for the stalled peer"
                 log_path = ROOT / "logs" / f"{name}.log"
+                observation.enter("deadline_log")
                 eventually(lambda: "reason=deadline" in log_path.read_text())
+                observation.enter("deadline_time")
                 assert time.monotonic() - ended >= 5, "stalled client expired early"
                 received = b""
+                observation.slow_received_bytes = 0
+                observation.enter("slow_receive")
                 while True:
                     remaining = deadline - time.monotonic()
                     assert remaining > 0, "producer drain exceeded fixture budget"
@@ -416,16 +581,27 @@ def producer_drain():
                     if not chunk:
                         break
                     received += chunk
+                    observation.slow_received_bytes = len(received)
+                observation.enter("truncated_snapshot")
                 assert len(received) < snapshot_bytes, "fixture did not retain a backpressured snapshot"
                 # Info follows the whole snapshot, so this truncated frame
                 # cannot constitute attachment readiness.
+                observation.enter("expiry_assertion")
                 expiry = [line for line in log_path.read_text().splitlines() if "reason=deadline" in line]
                 assert len(expiry) == 1 and "unsent=0" not in expiry[0], expiry
+                observation.enter("no_spawn")
                 assert not (ROOT / "spawned").exists()
+    except BaseException as error:
+        observation.failure(error, "before_fifo_cleanup")
+        raise
     finally:
+        observation.cleanup_phase = "fifo_close"
         os.close(control)
+        observation.cleanup_phase = "fifo_unlink"
         control_path.unlink()
+        observation.cleanup_phase = "producer_unlink"
         producer_path.unlink()
+        observation.cleanup_phase = None
 
 
 def switching():
