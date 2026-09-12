@@ -84,9 +84,9 @@ existing `zig-out/bin/zmx` selection and automatic build behavior are unchanged.
 No binary is copied, linked, modified, or rebuilt for an override.
 
 `bats test/producer_diagnostics.bats` runs nine finite, memory-only encoder,
-metrics, and failure-output checks using Python's standard library. These cases
-do not load the session helper, import the runtime fixture, or start
-zmx/PTY/socket sessions.
+metrics (including phase delivery timing), and failure-output checks using
+Python's standard library. These cases do not load the session helper, import
+the runtime fixture, or start zmx/PTY/socket sessions.
 The Python driver is `test/producer_diagnostics_checks.py`; each named case can
 also be selected directly with `python3 -B` and its case name.
 
@@ -98,6 +98,19 @@ absolute eight-second deadline, does not sleep after productive reads, and
 propagates EOF/read errors rather than spinning. Other fixture waits keep
 their existing behavior. Diagnostic read counts include readiness waits and
 do not imply continuous readability or one syscall per check.
+
+Producer failure records include `phase_first_productive_ms` and
+`phase_last_productive_ms`, relative to phase start.
+`phase_last_productive_age_ms` measures from the last productive sample to the
+existing failure observation; `phase_max_productive_gap_ms` is the largest
+interval between consecutive productive samples. One monotonic sample follows
+each productive read/capture return, retaining only first, last, and maximum
+gap. Values are rounded down to whole milliseconds. Timing is `null` when
+unobserved, phase timing is unmeasured, or cleanup is being reported; maximum
+gap is `null` with fewer than two productive samples. Zero is a valid sample
+or gap. These are sampled deliveries into the fixture buffer, not continuous
+readiness, CPU usage, kernel-blocked time, client liveness, or display
+acknowledgement. Sampling does not renew or extend any deadline.
 
 `bats test/standard_streams.bats` runs four real CLI/regular-file checks for
 stdout/stderr append mode and inherited nonzero offsets. They preserve a

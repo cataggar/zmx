@@ -2,6 +2,8 @@
 
 Read checks count single-read attempts, including readiness waits, not syscalls
 or continuous readiness. Nonempty sizes are the observed buffer growth.
+Progress timestamps sample completed read/capture calls, not readiness, CPU
+usage, or kernel-blocked time. Only first, last, and maximum gap are retained.
 Null means unobserved; an absent cached returncode does not establish liveness.
 """
 
@@ -30,6 +32,8 @@ NUMBERS = (
     "read_checks", "nonempty_reads", "received_bytes", "min_read_bytes", "max_read_bytes",
     "phase_read_checks", "phase_nonempty_reads", "phase_received_bytes",
     "phase_min_read_bytes", "phase_max_read_bytes",
+    "phase_first_productive_ms", "phase_last_productive_ms",
+    "phase_last_productive_age_ms", "phase_max_productive_gap_ms",
     "captured_bytes", "rows_observed", "client_returncode_cached", "errno",
     "socket_send_buffer_bytes", "snapshot_bytes", "slow_received_bytes", "failure_line",
 )
@@ -43,13 +47,23 @@ class ReadMetrics:
         self.bytes = 0
         self.minimum = None
         self.maximum = None
+        self.first_productive_ns = None
+        self.last_productive_ns = None
+        self.max_productive_gap_ns = None
 
-    def received(self, size):
+    def received(self, size, *, completed_ns=None):
         if size > 0:
             self.nonempty += 1
             self.bytes += size
             self.minimum = size if self.minimum is None else min(self.minimum, size)
             self.maximum = size if self.maximum is None else max(self.maximum, size)
+            if completed_ns is not None:
+                if self.first_productive_ns is None:
+                    self.first_productive_ns = completed_ns
+                if self.last_productive_ns is not None:
+                    gap = completed_ns - self.last_productive_ns
+                    self.max_productive_gap_ns = gap if self.max_productive_gap_ns is None else max(self.max_productive_gap_ns, gap)
+                self.last_productive_ns = completed_ns
 
     def scalars(self, prefix=""):
         return {
@@ -58,6 +72,18 @@ class ReadMetrics:
             prefix + "received_bytes": self.bytes,
             prefix + "min_read_bytes": self.minimum,
             prefix + "max_read_bytes": self.maximum,
+        }
+
+    def progress_scalars(self, started_ns, observed_ns):
+        measured = started_ns is not None and observed_ns is not None
+        first = self.first_productive_ns if measured else None
+        last = self.last_productive_ns if measured else None
+        gap = self.max_productive_gap_ns if measured else None
+        return {
+            "phase_first_productive_ms": None if first is None else (first - started_ns) // 1_000_000,
+            "phase_last_productive_ms": None if last is None else (last - started_ns) // 1_000_000,
+            "phase_last_productive_age_ms": None if last is None else (observed_ns - last) // 1_000_000,
+            "phase_max_productive_gap_ms": None if gap is None else gap // 1_000_000,
         }
 
 

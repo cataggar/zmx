@@ -25,9 +25,9 @@ def record(metrics, role="healthy"):
     return json.loads(encode(metrics, role))
 
 
-def feed(metrics, size):
+def feed(metrics, size, *, completed_ns=None):
     metrics.checks += 1
-    metrics.received(size)
+    metrics.received(size, completed_ns=completed_ns)
 
 
 def expect_rejection(*args):
@@ -65,6 +65,23 @@ def unobserved_versus_empty():
     assert observed["client_status_source"] == "popen_returncode_cache"
     assert observed["invalid_metrics"] is False
 
+    empty = diagnostic.ReadMetrics()
+    feed(empty, 0, completed_ns=8_000_000_000)
+    progress = empty.progress_scalars(0, 8_000_000_000)
+    assert progress == {
+        "phase_first_productive_ms": None,
+        "phase_last_productive_ms": None,
+        "phase_last_productive_age_ms": None,
+        "phase_max_productive_gap_ms": None,
+    }
+    metrics.update(empty.scalars())
+    metrics.update(empty.scalars("phase_"))
+    metrics.update(total_elapsed_ms=8000, phase_elapsed_ms=8000)
+    metrics.update(progress)
+    observed = record(metrics)
+    assert observed["read_checks"] == observed["phase_read_checks"] == 1
+    assert all(observed[name] is None for name in progress)
+
 
 def short_read_metrics():
     reads = diagnostic.ReadMetrics()
@@ -78,13 +95,70 @@ def short_read_metrics():
     metrics.update(reads.scalars())
     encoded = record(metrics)
     assert all(encoded[name] == value for name, value in reads.scalars().items())
+    assert all(value is None for value in reads.progress_scalars(0, 8_000_000_000).values())
+
+    start = 0
+    timed = diagnostic.ReadMetrics()
+    feed(timed, 1024, completed_ns=start)
+    assert timed.progress_scalars(start, start) == {
+        "phase_first_productive_ms": 0, "phase_last_productive_ms": 0,
+        "phase_last_productive_age_ms": 0, "phase_max_productive_gap_ms": None,
+    }
+    for size, offset in ((0, 1_000_000), (2048, 2_750_000), (0, 3_000_000), (512, 4_000_000)):
+        feed(timed, size, completed_ns=start + offset)
+    assert timed.scalars() == {
+        "read_checks": 5, "nonempty_reads": 3, "received_bytes": 3584,
+        "min_read_bytes": 512, "max_read_bytes": 2048,
+    }
+    assert timed.progress_scalars(start, start + 8_000_000) == {
+        "phase_first_productive_ms": 0, "phase_last_productive_ms": 4,
+        "phase_last_productive_age_ms": 4, "phase_max_productive_gap_ms": 2,
+    }
+    for started, observed in ((None, start), (start, None), (None, None)):
+        assert all(value is None for value in timed.progress_scalars(started, observed).values())
+
+    same_tick = diagnostic.ReadMetrics()
+    feed(same_tick, 1, completed_ns=start)
+    feed(same_tick, 1, completed_ns=start)
+    assert same_tick.progress_scalars(start, start) == {
+        "phase_first_productive_ms": 0, "phase_last_productive_ms": 0,
+        "phase_last_productive_age_ms": 0, "phase_max_productive_gap_ms": 0,
+    }
+
+    samples = []
+    for offsets in ((10, 20, 30), (10, 4000, 7990)):
+        sampled = diagnostic.ReadMetrics()
+        for offset in offsets:
+            feed(sampled, 1024, completed_ns=start + offset * 1_000_000)
+        feed(sampled, 0, completed_ns=start + 8_000_000_000)
+        samples.append(sampled)
+    assert samples[0].scalars() == samples[1].scalars()
+    for sampled, last, age, gap in ((samples[0], 30, 7970, 10), (samples[1], 7990, 10, 3990)):
+        metrics = unknown_metrics()
+        metrics.update(sampled.scalars("phase_"))
+        progress = sampled.progress_scalars(start, start + 8_000_000_000)
+        assert progress == {
+            "phase_first_productive_ms": 10, "phase_last_productive_ms": last,
+            "phase_last_productive_age_ms": age, "phase_max_productive_gap_ms": gap,
+        }
+        metrics.update(progress)
+        encoded = record(metrics)
+        assert all(encoded[name] == value for name, value in progress.items())
+        assert diagnostic.filter_failure_output(encode(metrics)) == encode(metrics)
 
 
 def phase_reset():
     total = diagnostic.ReadMetrics()
     phase = diagnostic.ReadMetrics()
+    start = 1_000_000_000
     feed(total, 1024)
-    feed(phase, 1024)
+    feed(phase, 1024, completed_ns=start)
+    feed(total, 512)
+    feed(phase, 512, completed_ns=start + 2_000_000)
+    assert phase.progress_scalars(start, start + 3_000_000) == {
+        "phase_first_productive_ms": 0, "phase_last_productive_ms": 2,
+        "phase_last_productive_age_ms": 1, "phase_max_productive_gap_ms": 2,
+    }
     before = total.scalars()
     phase = diagnostic.ReadMetrics()
     assert total.scalars() == before
@@ -92,15 +166,22 @@ def phase_reset():
         "read_checks": 0, "nonempty_reads": 0, "received_bytes": 0,
         "min_read_bytes": None, "max_read_bytes": None,
     }
+    start += 10_000_000
+    assert all(value is None for value in phase.progress_scalars(start, start).values())
     feed(total, 2048)
-    feed(phase, 2048)
+    feed(phase, 2048, completed_ns=start)
     metrics = unknown_metrics()
     metrics.update(total.scalars())
     metrics.update(phase.scalars("phase_"))
+    metrics.update(phase.progress_scalars(start, start + 4_000_000))
     encoded = record(metrics)
-    assert encoded["read_checks"] == 2 and encoded["phase_read_checks"] == 1
-    assert encoded["received_bytes"] == 3072 and encoded["phase_received_bytes"] == 2048
-    assert encoded["min_read_bytes"] == 1024 and encoded["phase_min_read_bytes"] == 2048
+    assert encoded["read_checks"] == 3 and encoded["phase_read_checks"] == 1
+    assert encoded["received_bytes"] == 3584 and encoded["phase_received_bytes"] == 2048
+    assert encoded["min_read_bytes"] == 512 and encoded["phase_min_read_bytes"] == 2048
+    assert encoded["phase_first_productive_ms"] == 0
+    assert encoded["phase_last_productive_ms"] == 0
+    assert encoded["phase_last_productive_age_ms"] == 4
+    assert encoded["phase_max_productive_gap_ms"] is None
 
 
 def cached_returncode():
@@ -209,11 +290,16 @@ def payload_non_disclosure():
         decoded = json.loads(encoded)
         assert not {"payload", "argv", "env", "path", "message", "traceback"} & set(decoded)
 
-    metrics = unknown_metrics()
-    metrics["received_bytes"] = payload
-    encoded = encode(metrics)
-    assert b"ENCODER_PAYLOAD_SENTINEL_" not in encoded
-    assert json.loads(encoded)["invalid_metrics"] is True
+    for name in (
+        "received_bytes", "phase_first_productive_ms", "phase_last_productive_ms",
+        "phase_last_productive_age_ms", "phase_max_productive_gap_ms",
+    ):
+        metrics = unknown_metrics()
+        metrics[name] = payload
+        encoded = encode(metrics)
+        assert b"ENCODER_PAYLOAD_SENTINEL_" not in encoded
+        decoded = json.loads(encoded)
+        assert decoded[name] is None and decoded["invalid_metrics"] is True
     expect_rejection(payload, "operation", "assertion", None, "other", unknown_metrics())
     extra = unknown_metrics()
     extra[payload] = payload
@@ -274,11 +360,22 @@ def failure_output_boundary():
         ("schema", "unknown"), ("client_status_source", "unknown"),
         ("terminal_role", "unknown"), ("phase", sentinel.decode("ascii")),
         ("read_checks", True), ("received_bytes", -1),
+        ("phase_first_productive_ms", sentinel.decode("ascii")),
+        ("phase_last_productive_ms", True),
+        ("phase_last_productive_age_ms", -1),
+        ("phase_max_productive_gap_ms", diagnostic.MAX_METRIC + 1),
         ("invalid_metrics", 1), ("payload", sentinel.decode("ascii")),
     ):
         changed = json.loads(valid)
         changed[name] = value
         malformed.append((json.dumps(changed, separators=(",", ":")) + "\n").encode("ascii"))
+    for name in (
+        "phase_first_productive_ms", "phase_last_productive_ms",
+        "phase_last_productive_age_ms", "phase_max_productive_gap_ms",
+    ):
+        missing = json.loads(valid)
+        del missing[name]
+        malformed.append((json.dumps(missing, separators=(",", ":")) + "\n").encode("ascii"))
     for captured in malformed:
         filtered = diagnostic.filter_failure_output(captured)
         assert filtered == b"producer diagnostics=unavailable\n"

@@ -372,8 +372,9 @@ class ProducerTerminal(Terminal):
         before = len(self.output)
         result = super()._read_chunk(timeout, suppress_read_errors=suppress_read_errors)
         size = len(self.output) - before
+        completed_ns = time.monotonic_ns() if size > 0 else None
         self.read_metrics.received(size)
-        self.phase_metrics.received(size)
+        self.phase_metrics.received(size, completed_ns=completed_ns)
         return result
 
     def expect_progress(self, text):
@@ -451,6 +452,7 @@ class ProducerObservation:
             metrics.update(self.client.read_metrics.scalars())
             if self.cleanup_phase is None:
                 metrics.update(self.client.phase_metrics.scalars("phase_"))
+                metrics.update(self.client.phase_metrics.progress_scalars(self.phase_started, observed))
             metrics.update(
                 captured_bytes=len(output),
                 rows_observed=rows,
