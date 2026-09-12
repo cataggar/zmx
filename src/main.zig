@@ -166,7 +166,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
         }
         resumeSession(&cfg, session_name) catch |err| {
             var buf: [4096]u8 = undefined;
-            var w = std.Io.File.stderr().writer(std.Options.debug_io, &buf);
+            var w = std.Io.File.stderr().writerStreaming(std.Options.debug_io, &buf);
             w.interface.print("error: session \"{s}\" unavailable for resume ({s}); no session created\n", .{
                 session_name, @errorName(err),
             }) catch {};
@@ -300,7 +300,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
         return send(&cfg, sesh, socket_path, text_parts.items, .Output);
     } else if (std.mem.eql(u8, cmd, "kill") or std.mem.eql(u8, cmd, "k")) {
         var stderr_buffer: [1024]u8 = undefined;
-        var stderr_writer = std.Io.File.stderr().writer(std.Options.debug_io, &stderr_buffer);
+        var stderr_writer = std.Io.File.stderr().writerStreaming(std.Options.debug_io, &stderr_buffer);
         const stderr = &stderr_writer.interface;
 
         var matchers: std.ArrayList(SessionMatch) = .empty;
@@ -2070,7 +2070,7 @@ test "drain: child identity is retained through final signal and reaped once" {
 
 fn printVersion(cfg: *Cfg) !void {
     var buf: [256]u8 = undefined;
-    var w = std.Io.File.stdout().writer(std.Options.debug_io, &buf);
+    var w = std.Io.File.stdout().writerStreaming(std.Options.debug_io, &buf);
     var ver = version;
     if (builtin.mode == .Debug) {
         ver = git_sha;
@@ -2085,14 +2085,14 @@ fn printVersion(cfg: *Cfg) !void {
 fn printCompletions(shell: completions.Shell) !void {
     const script = shell.getCompletionScript();
     var buf: [8192]u8 = undefined;
-    var w = std.Io.File.stdout().writer(std.Options.debug_io, &buf);
+    var w = std.Io.File.stdout().writerStreaming(std.Options.debug_io, &buf);
     try w.interface.print("{s}\n", .{script});
     try w.interface.flush();
 }
 
 fn cliUsageError(message: []const u8) noreturn {
     var buf: [512]u8 = undefined;
-    var w = std.Io.File.stderr().writer(std.Options.debug_io, &buf);
+    var w = std.Io.File.stderr().writerStreaming(std.Options.debug_io, &buf);
     w.interface.print("error: {s}\n", .{message}) catch {};
     w.interface.flush() catch {};
     std.process.exit(2);
@@ -2100,7 +2100,7 @@ fn cliUsageError(message: []const u8) noreturn {
 
 fn printCapabilities() !void {
     var buf: [128]u8 = undefined;
-    var w = std.Io.File.stdout().writer(std.Options.debug_io, &buf);
+    var w = std.Io.File.stdout().writerStreaming(std.Options.debug_io, &buf);
     try w.interface.writeAll("zmx-capabilities-v1\nresume\npreserve-scrollback\n");
     try w.interface.flush();
 }
@@ -2257,7 +2257,7 @@ fn help() !void {
         \\
     ;
     var buf: [8192]u8 = undefined;
-    var w = std.Io.File.stdout().writer(std.Options.debug_io, &buf);
+    var w = std.Io.File.stdout().writerStreaming(std.Options.debug_io, &buf);
     try w.interface.print(help_text, .{});
     try w.interface.flush();
 }
@@ -2425,11 +2425,11 @@ fn wait(cfg: *Cfg, matchers: std.ArrayList(SessionMatch)) !void {
     const alloc = gpa.allocator();
 
     var stdout_buffer: [1024]u8 = undefined;
-    var stdout_writer = std.Io.File.stdout().writer(std.Options.debug_io, &stdout_buffer);
+    var stdout_writer = std.Io.File.stdout().writerStreaming(std.Options.debug_io, &stdout_buffer);
     const stdout = &stdout_writer.interface;
 
     var stderr_buffer: [1024]u8 = undefined;
-    var stderr_writer = std.Io.File.stderr().writer(std.Options.debug_io, &stderr_buffer);
+    var stderr_writer = std.Io.File.stderr().writerStreaming(std.Options.debug_io, &stderr_buffer);
     const stderr = &stderr_writer.interface;
 
     // Highest match count seen so far. Lets us distinguish "sessions haven't
@@ -2608,7 +2608,7 @@ fn list(cfg: *Cfg, short: bool) !void {
 
     const current_session = socket.getSeshNameFromEnv();
     var buf: [4096]u8 = undefined;
-    var stdout = std.Io.File.stdout().writer(std.Options.debug_io, &buf);
+    var stdout = std.Io.File.stdout().writerStreaming(std.Options.debug_io, &buf);
 
     var sessions = try util.get_session_entries(alloc, cfg.socket_dir);
     defer {
@@ -2621,7 +2621,7 @@ fn list(cfg: *Cfg, short: bool) !void {
     if (sessions.items.len == 0) {
         if (short) return;
         var errbuf: [4096]u8 = undefined;
-        var stderr = std.Io.File.stderr().writer(std.Options.debug_io, &errbuf);
+        var stderr = std.Io.File.stderr().writerStreaming(std.Options.debug_io, &errbuf);
         try stderr.interface.print("no sessions found in {s}\n", .{cfg.socket_dir});
         try stderr.interface.flush();
         return;
@@ -2682,7 +2682,7 @@ fn kill(cfg: *Cfg, session_name: []const u8, force: bool) !void {
     const exists = try socket.sessionExists(dir, session_name);
     if (!exists) {
         var buf: [4096]u8 = undefined;
-        var w = std.Io.File.stderr().writer(std.Options.debug_io, &buf);
+        var w = std.Io.File.stderr().writerStreaming(std.Options.debug_io, &buf);
         w.interface.print("error: session \"{s}\" does not exist\n", .{session_name}) catch {};
         w.interface.flush() catch {};
         return error.SessionNotFound;
@@ -2690,7 +2690,7 @@ fn kill(cfg: *Cfg, session_name: []const u8, force: bool) !void {
     const fd = ipc.connectSession(socket_path) catch |err| {
         std.log.err("session unresponsive: {s}", .{@errorName(err)});
         var buf: [4096]u8 = undefined;
-        var w = std.Io.File.stdout().writer(std.Options.debug_io, &buf);
+        var w = std.Io.File.stdout().writerStreaming(std.Options.debug_io, &buf);
         if (force or err == error.ConnectionRefused) {
             socket.cleanupStaleSocket(dir, session_name);
             w.interface.print("cleaned up stale session {s}\n", .{session_name}) catch {};
@@ -2722,7 +2722,7 @@ fn kill(cfg: *Cfg, session_name: []const u8, force: bool) !void {
     }
 
     var buf: [100]u8 = undefined;
-    var w = std.Io.File.stdout().writer(std.Options.debug_io, &buf);
+    var w = std.Io.File.stdout().writerStreaming(std.Options.debug_io, &buf);
     try w.interface.print("killed session {s}\n", .{session_name});
     try w.interface.flush();
 }
@@ -2808,7 +2808,7 @@ fn history(cfg: *Cfg, session_name: []const u8, format: util.HistoryFormat) !voi
     const exists = try socket.sessionExists(dir, session_name);
     if (!exists) {
         var buf: [4096]u8 = undefined;
-        var w = std.Io.File.stderr().writer(std.Options.debug_io, &buf);
+        var w = std.Io.File.stderr().writerStreaming(std.Options.debug_io, &buf);
         w.interface.print("error: session \"{s}\" does not exist\n", .{session_name}) catch {};
         w.interface.flush() catch {};
         return error.SessionNotFound;
@@ -2866,7 +2866,7 @@ fn switchSesh(daemon: *Daemon, current_sesh: []const u8) !void {
     const exists = try socket.sessionExists(dir, current_sesh);
     if (!exists) {
         var buf: [4096]u8 = undefined;
-        var w = std.Io.File.stderr().writer(std.Options.debug_io, &buf);
+        var w = std.Io.File.stderr().writerStreaming(std.Options.debug_io, &buf);
         w.interface.print("error: session \"{s}\" does not exist\n", .{current_sesh}) catch {};
         w.interface.flush() catch {};
         return error.SessionNotFound;
@@ -3012,7 +3012,7 @@ fn attachConnected(client_sock: i32) !ClientResult {
 
 fn writeFile(daemon: *Daemon, file_path: []const u8) !void {
     var buf: [4096]u8 = undefined;
-    var w = std.Io.File.stdout().writer(std.Options.debug_io, &buf);
+    var w = std.Io.File.stdout().writerStreaming(std.Options.debug_io, &buf);
     const sesh_result = try daemon.ensureSession();
     if (sesh_result.is_daemon) return;
 
@@ -3101,7 +3101,7 @@ fn writeFile(daemon: *Daemon, file_path: []const u8) !void {
 fn send(cfg: *Cfg, session_name: []const u8, socket_path: []const u8, text_parts: [][]const u8, tag: ipc.Tag) !void {
     const alloc = std.heap.c_allocator;
     var buf: [4096]u8 = undefined;
-    var w = std.Io.File.stdout().writer(std.Options.debug_io, &buf);
+    var w = std.Io.File.stdout().writerStreaming(std.Options.debug_io, &buf);
 
     var payload = std.ArrayList(u8).empty;
     defer payload.deinit(alloc);
@@ -3163,7 +3163,7 @@ fn send(cfg: *Cfg, session_name: []const u8, socket_path: []const u8, text_parts
 fn run(daemon: *Daemon, detached: bool, command_args: [][]const u8) !void {
     const alloc = daemon.alloc;
     var buf: [4096]u8 = undefined;
-    var w = std.Io.File.stdout().writer(std.Options.debug_io, &buf);
+    var w = std.Io.File.stdout().writerStreaming(std.Options.debug_io, &buf);
 
     var cmd_to_send: ?[]const u8 = null;
     var allocated_cmd: ?[]u8 = null;

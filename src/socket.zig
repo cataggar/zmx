@@ -110,7 +110,7 @@ pub fn getSocketPath(
 
 pub fn printSessionNameTooLong(session_name: []const u8, socket_dir: []const u8) void {
     var buf: [4096]u8 = undefined;
-    var w = std.Io.File.stderr().writer(std.Options.debug_io, &buf);
+    var w = std.Io.File.stderr().writerStreaming(std.Options.debug_io, &buf);
     if (maxSessionNameLen(socket_dir)) |max_len| {
         w.interface.print(
             "error: session name is too long ({d} bytes, max {d} for socket directory \"{s}\")\n",

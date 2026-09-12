@@ -195,6 +195,7 @@ def payload_non_disclosure():
         (AssertionError(payload.encode("ascii")), "assertion"),
         (TimeoutError(payload), "timeout"),
         (OSError(5, payload, "/example/path"), "os_error"),
+        (EOFError(payload), "other"),
         (KeyboardInterrupt(payload), "keyboard_interrupt"),
         (SystemExit(payload), "system_exit"),
         (Unformattable(payload), "other"),

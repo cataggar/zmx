@@ -1,7 +1,7 @@
 """Pure, bounded scalar encoding for the producer fixture; no runtime probes.
 
-Read checks count Terminal.read invocations, not read syscalls or readiness.
-Nonempty sizes are the observed buffer growth from its one unchanged read.
+Read checks count single-read attempts, including readiness waits, not syscalls
+or continuous readiness. Nonempty sizes are the observed buffer growth.
 Null means unobserved; an absent cached returncode does not establish liveness.
 """
 

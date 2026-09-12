@@ -71,12 +71,20 @@ class Terminal:
         )
 
     def read(self):
-        if select.select([self.master], [], [], 0.05)[0]:
-            try:
-                self.output += os.read(self.master, 65536)
-            except OSError:
-                pass
+        self._read_chunk(0.05, suppress_read_errors=True)
         return self.output
+
+    def _read_chunk(self, timeout, *, suppress_read_errors):
+        if select.select([self.master], [], [], timeout)[0]:
+            try:
+                chunk = os.read(self.master, 65536)
+            except OSError:
+                if not suppress_read_errors:
+                    raise
+                return None
+            self.output += chunk
+            return chunk
+        return None
 
     def expect(self, text):
         eventually(lambda: text in self.read())
@@ -350,7 +358,7 @@ def closing_restore():
 
 
 class ProducerTerminal(Terminal):
-    """Producer-only counters around the unchanged single-read implementation."""
+    """Producer-only counters and a readiness-driven bulk-output wait."""
 
     def __init__(self, *args, **kwargs):
         from producer_diagnostics import ReadMetrics
@@ -358,15 +366,24 @@ class ProducerTerminal(Terminal):
         self.phase_metrics = ReadMetrics()
         super().__init__(*args, **kwargs)
 
-    def read(self):
+    def _read_chunk(self, timeout, *, suppress_read_errors):
         self.read_metrics.checks += 1
         self.phase_metrics.checks += 1
         before = len(self.output)
-        result = super().read()
+        result = super()._read_chunk(timeout, suppress_read_errors=suppress_read_errors)
         size = len(self.output) - before
         self.read_metrics.received(size)
         self.phase_metrics.received(size)
         return result
+
+    def expect_progress(self, text):
+        from producer_readiness import wait_for_output
+        wait_for_output(
+            lambda: text in self.output,
+            lambda remaining: self._read_chunk(remaining, suppress_read_errors=False),
+            time.monotonic,
+            TIMEOUT,
+        )
 
 
 class ProducerObservation:
@@ -398,14 +415,17 @@ class ProducerObservation:
         self.attempted = True
         observed = time.monotonic_ns()
         from producer_diagnostics import FLAGS, NUMBERS, encode_failure, error_kind
+        from producer_readiness import wait_for_output
         metrics = dict.fromkeys(NUMBERS + FLAGS)
         # Whitelist code objects, never filenames or exception messages. The
         # innermost recognized site distinguishes a wait timeout from an assert.
         sites = {
             _producer_drain.__code__: "producer",
             eventually.__code__: "wait",
+            wait_for_output.__code__: "wait",
             Terminal.__init__.__code__: "terminal_init",
             Terminal.read.__code__: "terminal_read",
+            Terminal._read_chunk.__code__: "terminal_read",
             Terminal.expect.__code__: "terminal_expect",
             Terminal.finished.__code__: "terminal_finished",
             Terminal.close.__code__: "terminal_close",
@@ -525,7 +545,7 @@ def _producer_drain(observation):
             observation.enter("producer_emit")
             os.write(control, b"d")
             observation.enter("healthy_complete")
-            healthy.expect(b"PRODUCER_COMPLETE")
+            healthy.expect_progress(b"PRODUCER_COMPLETE")
             observation.enter("row_count")
             assert healthy.output.count(b"ROW_") == 12000
             observation.enter("slow_create")

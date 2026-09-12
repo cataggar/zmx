@@ -90,6 +90,20 @@ zmx/PTY/socket sessions.
 The Python driver is `test/producer_diagnostics_checks.py`; each named case can
 also be selected directly with `python3 -B` and its case name.
 
+`bats test/producer_readiness.bats` runs five pure checks with an injected clock
+and reader: legal short reads, an idle deadline, progress without deadline
+renewal, EOF, and read errors. The producer fixture uses this readiness-driven
+wait only for the healthy client's bulk-output completion. It keeps one
+absolute eight-second deadline, does not sleep after productive reads, and
+propagates EOF/read errors rather than spinning. Other fixture waits keep
+their existing behavior. Diagnostic read counts include readiness waits and
+do not imply continuous readability or one syscall per check.
+
+`bats test/standard_streams.bats` runs four real CLI/regular-file checks for
+stdout/stderr append mode and inherited nonzero offsets. They preserve a
+pre-existing prefix and check that writes advance the shared file offset;
+no daemon or PTY is created by these cases.
+
 The producer fixture's Bats wrapper publishes only its failure status and one
 complete, bounded canonical diagnostic record. It reuses the record encoder
 to validate captured output before Bats receives it. Initialization errors,
@@ -573,6 +587,12 @@ You can configure the permissions for the socket directory and log files using t
 This is particularly useful when running `zmx` as a system service with a shared group. For example, setting `ZMX_DIR_MODE=0770` and `ZMX_LOG_MODE=0660` allows group members to attach to the session.
 
 ## debugging
+
+CLI stdout and stderr use streaming writes, including when redirected to a
+regular file. They honor the inherited file offset and append mode instead
+of starting a positional writer at byte zero. Output text and exit codes are
+unchanged. The file logger retains its explicit positional offsets and
+rotation behavior.
 
 We store global logs for cli commands in `{log_dir}/zmx.log`. We store session-specific logs in `{log_dir}/{session_name}.log`. Right now they are enabled by default and cannot be disabled. The idea here is to help with initial development until we reach a stable state.
 
