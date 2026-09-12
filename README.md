@@ -77,6 +77,18 @@ If the test directory exceeds the OS Unix-socket path limit, set
 `ZMX_TEST_SOCKET_ROOT` to an existing, empty directory with a shorter absolute
 path; each test creates its own socket directory beneath it.
 
+Set `ZMX_TEST_BIN` to an absolute regular executable file to use an existing
+binary in the Bats session tests. An invalid override, including an explicitly
+empty value, fails setup without building or falling back. When unset, the
+existing `zig-out/bin/zmx` selection and automatic build behavior are unchanged.
+No binary is copied, linked, modified, or rebuilt for an override.
+
+`bats test/producer_diagnostics.bats` runs eight finite, memory-only encoder and
+metrics checks using Python's standard library. These cases do not load the
+session helper, import the runtime fixture, or start zmx/PTY/socket sessions.
+The Python driver is `test/producer_diagnostics_checks.py`; each named case can
+also be selected directly with `python3 -B` and its case name.
+
 Select unit tests with repeatable, nonempty filters, for example
 `zig build test -Dtest-filter=attachment: -Dtest-filter=drain: -Dtest-filter=serializeTerminalState`.
 The attachment and producer-drain tests use in-memory IPC queues, an injected

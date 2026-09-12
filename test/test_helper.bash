@@ -3,11 +3,21 @@
 REPO_DIR="$(cd "$BATS_TEST_DIRNAME/.." && pwd)"
 
 setup() {
-  # Build once per test suite (skips if already built)
-  if [[ ! -x "$REPO_DIR/zig-out/bin/zmx" ]]; then
-    cd "$REPO_DIR" && zig build
+  # A rejected override must not leave an inherited executable for teardown.
+  ZMX=""
+  if [[ -n "${ZMX_TEST_BIN+x}" ]]; then
+    if [[ "$ZMX_TEST_BIN" != /* || ! -f "$ZMX_TEST_BIN" || ! -x "$ZMX_TEST_BIN" ]]; then
+      printf 'ZMX_TEST_BIN must name an absolute regular executable file\n' >&2
+      return 1
+    fi
+    ZMX="$ZMX_TEST_BIN"
+  else
+    # Build once per test suite (skips if already built)
+    if [[ ! -x "$REPO_DIR/zig-out/bin/zmx" ]]; then
+      cd "$REPO_DIR" && zig build
+    fi
+    ZMX="$REPO_DIR/zig-out/bin/zmx"
   fi
-  ZMX="$REPO_DIR/zig-out/bin/zmx"
 
   # Isolate socket dir so tests don't interfere with real sessions or each other
   if [[ -n "${ZMX_TEST_SOCKET_ROOT:-}" ]]; then
@@ -23,7 +33,7 @@ setup() {
 
 teardown() {
   # Kill any sessions created during this test
-  if [[ -d "$ZMX_DIR" ]]; then
+  if [[ -n "${ZMX:-}" && -d "${ZMX_DIR:-}" ]]; then
     local sessions
     sessions=$("$ZMX" list --short 2>/dev/null) || true
     if [[ -n "$sessions" ]]; then
