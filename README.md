@@ -68,9 +68,23 @@ zig build -Doptimize=ReleaseSafe --prefix ~/.local
 
 ### tests
 
-Run `zig build test` for unit tests. With Bats, Python 3, Bash, and `timeout`
-installed, run `zig build && bats test` for the real session/PTY integration
-tests. These isolate their sockets and logs from running sessions. The
+Run `zig build` and `zig build test` for the Debug build and unit tests.
+CI retains both, then builds a separate ReleaseSafe binary for the full
+integration suite. This tests release-mode behavior without making bulk
+preparation depend on Ghostty's Debug-only slow integrity checks. Payloads,
+assertions, and the eight-second preparation and five-second drain limits
+remain unchanged.
+
+With Bats, Python 3, Bash, and `timeout` installed, run the same real
+session/PTY integration suite locally with:
+
+```sh
+zig build -Doptimize=ReleaseSafe --prefix zig-out/integration
+ZMX_TEST_BIN="$(pwd)/zig-out/integration/bin/zmx" bats test
+```
+
+The separate prefix preserves the Debug `zig-out/bin/zmx`. These tests
+isolate their sockets and logs from running sessions. The
 `resume.bats` cases cover terminal restoration, multiple clients, switching,
 non-creation on missing/stale sockets, and deterministic daemon disappearance.
 If the test directory exceeds the OS Unix-socket path limit, set
