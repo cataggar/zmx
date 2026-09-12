@@ -621,6 +621,11 @@ of starting a positional writer at byte zero. Output text and exit codes are
 unchanged. The file logger retains its explicit positional offsets and
 rotation behavior.
 
+Closing the file logger clears its owned file and path. Later logging,
+including Zig's reporting of an error returned by `main`, falls back to
+stderr instead of writing through a closed file handle. Repeated logger
+cleanup is safe.
+
 We store global logs for cli commands in `{log_dir}/zmx.log`. We store session-specific logs in `{log_dir}/{session_name}.log`. Right now they are enabled by default and cannot be disabled. The idea here is to help with initial development until we reach a stable state.
 
 The log directory is resolved in this order:
