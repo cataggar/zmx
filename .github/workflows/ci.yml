@@ -24,8 +24,13 @@ jobs:
       - name: Run unit tests
         run: zig build test --summary all
 
+      - name: Build ReleaseSafe integration binary
+        run: zig build -Doptimize=ReleaseSafe --prefix zig-out/integration --summary all
+
       - name: Install integration test runner
         run: sudo apt-get update -qq && sudo apt-get install -y bats
 
-      - name: Run integration tests
+      - name: Run integration tests (ReleaseSafe)
+        env:
+          ZMX_TEST_BIN: ${{ github.workspace }}/zig-out/integration/bin/zmx
         run: bats test

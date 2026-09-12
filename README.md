@@ -68,14 +68,81 @@ zig build -Doptimize=ReleaseSafe --prefix ~/.local
 
 ### tests
 
-Run `zig build test` for unit tests. With Bats, Python 3, Bash, and `timeout`
-installed, run `zig build && bats test` for the real session/PTY integration
-tests. These isolate their sockets and logs from running sessions. The
+Run `zig build` and `zig build test` for the Debug build and unit tests.
+CI retains both, then builds a separate ReleaseSafe binary for the full
+integration suite. This tests release-mode behavior without making bulk
+preparation depend on Ghostty's Debug-only slow integrity checks. Payloads,
+assertions, and the eight-second preparation and five-second drain limits
+remain unchanged.
+
+With Bats, Python 3, Bash, and `timeout` installed, run the same real
+session/PTY integration suite locally with:
+
+```sh
+zig build -Doptimize=ReleaseSafe --prefix zig-out/integration
+ZMX_TEST_BIN="$(pwd)/zig-out/integration/bin/zmx" bats test
+```
+
+The separate prefix preserves the Debug `zig-out/bin/zmx`. These tests
+isolate their sockets and logs from running sessions. The
 `resume.bats` cases cover terminal restoration, multiple clients, switching,
 non-creation on missing/stale sockets, and deterministic daemon disappearance.
 If the test directory exceeds the OS Unix-socket path limit, set
 `ZMX_TEST_SOCKET_ROOT` to an existing, empty directory with a shorter absolute
 path; each test creates its own socket directory beneath it.
+
+Set `ZMX_TEST_BIN` to an absolute regular executable file to use an existing
+binary in the Bats session tests. An invalid override, including an explicitly
+empty value, fails setup without building or falling back. When unset, the
+existing `zig-out/bin/zmx` selection and automatic build behavior are unchanged.
+No binary is copied, linked, modified, or rebuilt for an override.
+
+`bats test/producer_diagnostics.bats` runs nine finite, memory-only encoder,
+metrics (including phase delivery timing), and failure-output checks using
+Python's standard library. These cases do not load the session helper, import
+the runtime fixture, or start zmx/PTY/socket sessions.
+The Python driver is `test/producer_diagnostics_checks.py`; each named case can
+also be selected directly with `python3 -B` and its case name.
+
+`bats test/producer_readiness.bats` runs five pure checks with an injected clock
+and reader: legal short reads, an idle deadline, progress without deadline
+renewal, EOF, and read errors. The producer fixture uses this readiness-driven
+wait only for the healthy client's bulk-output completion. It keeps one
+absolute eight-second deadline, does not sleep after productive reads, and
+propagates EOF/read errors rather than spinning. Other fixture waits keep
+their existing behavior. Diagnostic read counts include readiness waits and
+do not imply continuous readability or one syscall per check.
+
+Producer failure records include `phase_first_productive_ms` and
+`phase_last_productive_ms`, relative to phase start.
+`phase_last_productive_age_ms` measures from the last productive sample to the
+existing failure observation; `phase_max_productive_gap_ms` is the largest
+interval between consecutive productive samples. One monotonic sample follows
+each productive read/capture return, retaining only first, last, and maximum
+gap. Values are rounded down to whole milliseconds. Timing is `null` when
+unobserved, phase timing is unmeasured, or cleanup is being reported; maximum
+gap is `null` with fewer than two productive samples. Zero is a valid sample
+or gap. These are sampled deliveries into the fixture buffer, not continuous
+readiness, CPU usage, kernel-blocked time, client liveness, or display
+acknowledgement. Sampling does not renew or extend any deadline.
+
+`bats test/standard_streams.bats` runs four real CLI/regular-file checks for
+stdout/stderr append mode and inherited nonzero offsets. They preserve a
+pre-existing prefix and check that writes advance the shared file offset;
+no daemon or PTY is created by these cases.
+
+The producer fixture's Bats wrapper publishes only its failure status and one
+complete, bounded canonical diagnostic record. It reuses the record encoder
+to validate captured output before Bats receives it. Initialization errors,
+malformed/oversized output, or validator failure produce an explicit
+`producer diagnostics=unavailable` message, never a captured traceback.
+The original fixture failure remains nonzero.
+
+Select unit tests with repeatable, nonempty filters, for example
+`zig build test -Dtest-filter=attachment: -Dtest-filter=drain: -Dtest-filter=serializeTerminalState`.
+The attachment and producer-drain tests use in-memory IPC queues, an injected
+clock/transport, and Ghostty terminals, not
+daemons, PTYs, sockets, signals, environment changes, or login shells.
 
 ## usage
 
@@ -135,6 +202,80 @@ independently replace a daemon under the same name before the connection.
 Nor does exit `0` prove the remote shell is still alive after detachment.
 Retry policy belongs to the caller; `resume` does not retry or inject
 terminal-stream control markers.
+
+### initial state and live output
+
+Updated clients and daemons establish a snapshot/live boundary even on the
+first attachment. Output consumed before the client connected is recovered
+from retained terminal state. Output arriving between connection and Init is
+not displayed twice: the client holds early frames, discards them at the
+boundary, then displays the snapshot and subsequent live output. The daemon
+captures the snapshot before resizing the PTY and emulator.
+Scrollback is moved past the receiving terminal's viewport before the snapshot
+clears that viewport, so the last visible portion of history is not erased.
+
+An unfinished VT sequence or UTF-8 character is restored after the visual
+snapshot, before live bytes, using Ghostty's replay-safe parser continuation.
+This omits effects already committed to the snapshot (such as a newline
+inside an unfinished CSI). The daemon does not wait for a sequence to finish.
+Continuation tracking has a separate bounded buffer capped by the configured
+scrollback byte limit. If a required continuation is unavailable, or snapshot
+or reply allocation fails, setup rejects only that client without a readiness
+reply; the session and other clients remain alive. Tracking can recover when
+subsequent output reaches parser ground. There is no automatic retry.
+
+This restores retained state of the **active screen**, not an exact byte log
+or both screen buffers. It cannot recover text already erased by an
+application or evicted from scrollback, preserve unanswered terminal queries
+as a replay log, or deduplicate history from a previous connection.
+Synchronized-output mode is excluded from snapshots as before.
+
+The optional IPC `Attach` tag (`14`) has empty request and response payloads.
+Clients send `Attach`, the unchanged `Init` size, then `Info`. On `Attach` the
+daemon pauses that client's live output until Init, while continuing to
+update terminal state. Its response precedes the snapshot. Earlier frames
+are allowed to finish on the socket, including partially written frames.
+The boundary is IPC metadata, never text injected into the terminal.
+
+Silent `tail` connections and non-Init `run`, `write`, and probe clients keep
+their existing streaming behavior. Older compatible daemons ignore the
+unknown tag; their Info response releases the legacy output instead. Older
+terminal clients keep their legacy Init behavior, including its first-attach
+limitation. The improved handoff therefore requires **both** an updated client
+and daemon; replacing the executable does not upgrade already-running daemons.
+The existing capability response and resume exit codes are unchanged.
+
+### final output after producer EOF
+
+At the first PTY EOF observation the daemon starts a **fixed five-second
+awake-time drain window**. One immutable deadline applies to all remaining
+client queues; progress, repeated EOF, and interrupted waits do not renew it.
+The dead PTY and listener are no longer polled, and no new Init, Info, or
+application work is processed. The window applies only after producer EOF,
+not to live sessions. Linux's closed-slave EIO is also treated as PTY EOF.
+
+Each client drains independently and is closed promptly when its queue is
+empty. Partial writes and EAGAIN preserve the remaining bytes. At expiry,
+stalled clients are disconnected and their unsent bytes discarded. Peer
+failure or explicit cancellation can end delivery earlier. On an existing
+draining connection, detach cancels that client and kill/detach-all cancels
+the drain; daemon SIGTERM also cancels the drain. New connections are not
+accepted during draining.
+Unexpected polling failures are reported as errors, not successful delivery.
+No new buffer cap is imposed.
+
+The deadline uses a monotonic awake clock, unaffected by wall-clock changes
+and paused during system suspension; scheduling can delay expiry processing.
+The forkpty child remains unreaped through draining and the existing final
+group signals, preventing PID/process-group reuse during the window. Reaping
+happens once after the last signal.
+
+An empty sender queue means bytes were handed to the socket, **not**
+acknowledged or displayed by the receiving terminal. Client-side draining
+preserves complete frames already delivered. A truncated snapshot without
+Info still does not confirm attachment, and non-creating resume remains
+unsuccessful in that case. The existing client cleanup, capability response,
+and exit codes are unchanged.
 
 ### client cleanup and scrollback
 
@@ -473,6 +614,17 @@ You can configure the permissions for the socket directory and log files using t
 This is particularly useful when running `zmx` as a system service with a shared group. For example, setting `ZMX_DIR_MODE=0770` and `ZMX_LOG_MODE=0660` allows group members to attach to the session.
 
 ## debugging
+
+CLI stdout and stderr use streaming writes, including when redirected to a
+regular file. They honor the inherited file offset and append mode instead
+of starting a positional writer at byte zero. Output text and exit codes are
+unchanged. The file logger retains its explicit positional offsets and
+rotation behavior.
+
+Closing the file logger clears its owned file and path. Later logging,
+including Zig's reporting of an error returned by `main`, falls back to
+stderr instead of writing through a closed file handle. Repeated logger
+cleanup is safe.
 
 We store global logs for cli commands in `{log_dir}/zmx.log`. We store session-specific logs in `{log_dir}/{session_name}.log`. Right now they are enabled by default and cannot be disabled. The idea here is to help with initial development until we reach a stable state.
 

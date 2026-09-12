@@ -3,4 +3,6 @@ comptime {
     _ = @import("util.zig");
     _ = @import("socket.zig");
     _ = @import("ipc.zig");
+    _ = @import("attachment.zig");
+    _ = @import("log.zig");
 }

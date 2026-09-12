@@ -11,6 +11,7 @@ const cross = @import("cross.zig");
 const socket = @import("socket.zig");
 const env = @import("env.zig");
 const compat = @import("compat.zig");
+const attachment = @import("attachment.zig");
 
 pub const version = build_options.version;
 pub const ghostty_version = build_options.ghostty_version;
@@ -165,7 +166,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
         }
         resumeSession(&cfg, session_name) catch |err| {
             var buf: [4096]u8 = undefined;
-            var w = std.Io.File.stderr().writer(std.Options.debug_io, &buf);
+            var w = std.Io.File.stderr().writerStreaming(std.Options.debug_io, &buf);
             w.interface.print("error: session \"{s}\" unavailable for resume ({s}); no session created\n", .{
                 session_name, @errorName(err),
             }) catch {};
@@ -299,7 +300,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
         return send(&cfg, sesh, socket_path, text_parts.items, .Output);
     } else if (std.mem.eql(u8, cmd, "kill") or std.mem.eql(u8, cmd, "k")) {
         var stderr_buffer: [1024]u8 = undefined;
-        var stderr_writer = std.Io.File.stderr().writer(std.Options.debug_io, &stderr_buffer);
+        var stderr_writer = std.Io.File.stderr().writerStreaming(std.Options.debug_io, &stderr_buffer);
         const stderr = &stderr_writer.interface;
 
         var matchers: std.ArrayList(SessionMatch) = .empty;
@@ -495,11 +496,127 @@ const Client = struct {
     has_pending_output: bool = false,
     read_buf: ipc.SocketBuffer,
     write_buf: std.ArrayList(u8),
+    admission: attachment.Admission = .{},
+    drain_read_closed: bool = false,
 
     pub fn deinit(self: *Client) void {
         compat.close(self.socket_fd);
+        self.deinitBuffers();
+    }
+
+    fn deinitBuffers(self: *Client) void {
         self.read_buf.deinit();
         self.write_buf.deinit(self.alloc);
+    }
+};
+
+const ClientInitIo = struct {
+    pty_fd: i32,
+    index: usize,
+
+    fn resize(self: ClientInitIo, size: ipc.Resize) void {
+        var ws: cross.c.struct_winsize = .{
+            .ws_row = size.rows,
+            .ws_col = size.cols,
+            .ws_xpixel = size.xpixel,
+            .ws_ypixel = size.ypixel,
+        };
+        _ = cross.c.ioctl(self.pty_fd, cross.c.TIOCSWINSZ, &ws);
+    }
+
+    fn reject(self: ClientInitIo, daemon: *Daemon, client: *Client, err: anyerror) void {
+        std.log.warn("rejecting client setup fd={d} err={s}", .{ client.socket_fd, @errorName(err) });
+        _ = daemon.closeClient(client, self.index, false);
+    }
+};
+
+const FinalOutputWindow = struct {
+    const duration_ns = 5 * std.time.ns_per_s;
+    deadline_ns: ?i96 = null,
+
+    fn observeEof(self: *FinalOutputWindow, now_ns: i96) void {
+        if (self.deadline_ns == null) self.deadline_ns = now_ns + duration_ns;
+    }
+
+    fn remainingMs(self: FinalOutputWindow, now_ns: i96) i32 {
+        const remaining = self.deadline_ns.? - now_ns;
+        if (remaining <= 0) return 0;
+        return @intCast(@divTrunc(remaining + std.time.ns_per_ms - 1, std.time.ns_per_ms));
+    }
+};
+
+const FinalOutputIo = struct {
+    signal_fd: posix.fd_t,
+
+    fn now(_: @This()) i96 {
+        return std.Io.Timestamp.now(std.Options.debug_io, .awake).nanoseconds;
+    }
+
+    fn poll(_: @This(), fds: []posix.pollfd, timeout_ms: i32) !void {
+        // Unlike posix.poll, return on EINTR so the owner recomputes the
+        // remaining immutable deadline instead of restarting a full timeout.
+        const rc = std.c.poll(fds.ptr, @intCast(fds.len), timeout_ms);
+        if (rc < 0 and std.c.errno(rc) != .INTR) {
+            std.log.err("final output poll failed errno={s}", .{@tagName(std.c.errno(rc))});
+            return error.FinalOutputPollFailed;
+        }
+    }
+
+    fn read(_: @This(), client: *Client) !usize {
+        return client.read_buf.read(client.socket_fd);
+    }
+
+    fn write(_: @This(), fd: posix.fd_t, bytes: []const u8) !usize {
+        return compat.write(fd, bytes);
+    }
+
+    fn closeClient(_: @This(), daemon: *Daemon, client: *Client, index: usize, reason: FinalOutputClose) void {
+        std.log.info("final output client closed fd={d} reason={s} unsent={d}", .{
+            client.socket_fd, @tagName(reason), client.write_buf.items.len,
+        });
+        _ = daemon.closeClient(client, index, false);
+    }
+};
+
+const FinalOutputClose = enum { drained, deadline, peer_failure, cancelled };
+
+// Keep the unreaped forkpty child until after the last group signal. Its PID
+// reserves the original process-group identity even if it exits during drain.
+const RetainedChild = struct {
+    pid: ?posix.pid_t = null,
+
+    fn finish(self: *RetainedChild, io: anytype) void {
+        const pid = self.pid orelse return;
+        std.debug.assert(pid > 0);
+        io.signalGroup(pid, .HUP);
+        io.grace();
+        io.signalGroup(pid, .KILL);
+        io.reap(pid);
+        self.pid = null;
+    }
+};
+
+const ChildCleanupIo = struct {
+    fn signalGroup(_: @This(), pid: posix.pid_t, signal: posix.SIG) void {
+        posix.kill(-pid, signal) catch |err| {
+            std.log.warn("failed to signal pty child group pid={d} signal={s} err={s}", .{
+                pid, @tagName(signal), @errorName(err),
+            });
+        };
+    }
+
+    fn grace(_: @This()) void {
+        compat.sleep(500 * std.time.ns_per_ms);
+    }
+
+    fn reap(_: @This(), pid: posix.pid_t) void {
+        while (true) {
+            const result = compat.waitpid(pid, 0);
+            if (result.pid == pid) return;
+            if (result.pid < 0 and std.c.errno(@as(c_int, -1)) == .INTR) continue;
+            std.log.warn("failed to reap pty child pid={d}", .{pid});
+            return;
+        }
     }
 };
 
@@ -655,6 +772,7 @@ const Daemon = struct {
     task_ended_at: ?u64 = null, // timestamp when task exited
     pty_fd: i32 = -1, // set by daemonLoop so handleRun can probe the foreground process
     pty_write_buf: std.ArrayList(u8) = .empty,
+    child: RetainedChild = .{},
 
     const EnsureSessionResult = struct {
         created: bool,
@@ -678,7 +796,17 @@ const Daemon = struct {
         self.clients.clearRetainingCapacity();
     }
 
-    pub fn closeClient(self: *Daemon, client: *Client, i: usize, shutdown_on_last: bool) bool {
+    pub fn closeClient(self: *Daemon, client: *Client, i: usize, comptime shutdown_on_last: bool) bool {
+        return self.closeClientUsing(client, i, shutdown_on_last, compat.close);
+    }
+
+    fn closeClientUsing(
+        self: *Daemon,
+        client: *Client,
+        i: usize,
+        comptime shutdown_on_last: bool,
+        comptime close: fn (posix.fd_t) void,
+    ) bool {
         const fd = client.socket_fd;
         // leader is disconnected, remove ref and let another client claim leader on input
         if (self.leader_client_fd == client.socket_fd) {
@@ -688,7 +816,8 @@ const Daemon = struct {
             );
             self.leader_client_fd = null;
         }
-        client.deinit();
+        close(client.socket_fd);
+        client.deinitBuffers();
         self.alloc.destroy(client);
         _ = self.clients.orderedRemove(i);
         std.log.info("client disconnected fd={d} remaining={d}", .{ fd, self.clients.items.len });
@@ -784,6 +913,11 @@ const Daemon = struct {
         }
         // master pid code path
         self.pid = pid;
+        self.child.pid = pid;
+        errdefer {
+            self.child.finish(ChildCleanupIo{});
+            compat.close(master_fd);
+        }
         std.log.info("pty spawned session={s} pid={d}", .{ self.session_name, pid });
 
         // make pty non-blocking
@@ -900,6 +1034,14 @@ const Daemon = struct {
                 // If spawnPty fails, clean up here. Once it succeeds,
                 // the inner block's defer takes ownership of cleanup to
                 // avoid double-closing server_sock_fd on daemonLoop error.
+                // An inherited SIG_IGN/SA_NOCLDWAIT would auto-reap the child
+                // and permit PID reuse during final output draining.
+                const child_action: posix.Sigaction = .{
+                    .handler = .{ .handler = posix.SIG.DFL },
+                    .mask = posix.sigemptyset(),
+                    .flags = 0,
+                };
+                posix.sigaction(posix.SIG.CHLD, &child_action, null);
                 const pty_fd = self.spawnPty() catch |err| {
                     compat.close(server_sock_fd);
                     dir.deleteFile(std.Options.debug_io, self.session_name) catch {};
@@ -919,7 +1061,6 @@ const Daemon = struct {
                     self.handleKill();
                     self.deinit();
                     compat.close(pty_fd);
-                    _ = compat.waitpid(self.pid, 0);
                 }
 
                 try daemonLoop(self, server_sock_fd, pty_fd);
@@ -994,41 +1135,56 @@ const Daemon = struct {
         return error.NoLeaderFound;
     }
 
-    pub fn handleInit(
+    /// False tells the message loop to skip the rest of this client's batch,
+    /// including Info and the socket flush. Rejection never shuts down a session.
+    fn dispatchInit(
         self: *Daemon,
         client: *Client,
-        pty_fd: i32,
         term: *ghostty_vt.Terminal,
+        stream: *const ghostty_vt.TerminalStream,
         payload: []const u8,
+        io: anytype,
+    ) bool {
+        self.handleInit(client, term, stream, payload, io) catch |err| {
+            io.reject(self, client, err);
+            return false;
+        };
+        return true;
+    }
+
+    fn dispatchInfo(self: *Daemon, client: *Client, io: anytype) bool {
+        self.handleInfo(client) catch |err| {
+            io.reject(self, client, err);
+            return false;
+        };
+        return true;
+    }
+
+    fn handleInit(
+        self: *Daemon,
+        client: *Client,
+        term: *ghostty_vt.Terminal,
+        stream: *const ghostty_vt.TerminalStream,
+        payload: []const u8,
+        io: anytype,
     ) !void {
-        if (payload.len != @sizeOf(ipc.Resize)) return;
+        if (payload.len != @sizeOf(ipc.Resize)) return error.InvalidInit;
+        const resize = std.mem.bytesToValue(ipc.Resize, payload);
+        if (resize.rows == 0 or resize.cols == 0) return error.InvalidInit;
 
         // Serialize terminal state BEFORE resize to capture correct cursor position.
         // Resizing triggers reflow which can move the cursor, and the shell's
         // SIGWINCH-triggered redraw will run after our snapshot is sent.
-        // Only serialize on re-attach (has_had_client), not first attach, to avoid
-        // interfering with shell initialization (DA1 queries, etc.)
-        if (self.has_pty_output and self.has_had_client) {
-            const cursor = &term.screens.active.cursor;
-            std.log.debug(
-                "cursor before serialize: x={d} y={d} pending_wrap={}",
-                .{ cursor.x, cursor.y, cursor.pending_wrap },
-            );
-            if (util.serializeTerminalState(self.alloc, term)) |term_output| {
-                std.log.debug("serialize terminal state", .{});
-                // Rewrite OSC 133;A to include redraw=0 so the outer terminal
-                // does not clear prompt lines on resize (issue #111).
-                const restore_data = util.rewritePromptRedraw(self.alloc, term_output) orelse term_output;
-                defer self.alloc.free(term_output);
-                defer if (restore_data.ptr != term_output.ptr) self.alloc.free(restore_data);
-                ipc.appendMessage(self.alloc, &client.write_buf, .Output, restore_data) catch |err| {
-                    std.log.warn(
-                        "failed to buffer terminal state for client err={s}",
-                        .{@errorName(err)},
-                    );
-                };
-                client.has_pending_output = true;
-            }
+        if (try client.admission.prepareInit(
+            self.alloc,
+            &client.write_buf,
+            term,
+            stream,
+            self.has_pty_output,
+            self.has_had_client,
+            resize.rows,
+        )) {
+            client.has_pending_output = true;
         }
 
         // no leader is set so set one
@@ -1038,14 +1194,7 @@ const Daemon = struct {
 
         // only resize if leader
         if (self.leader_client_fd == client.socket_fd) {
-            const resize = std.mem.bytesToValue(ipc.Resize, payload);
-            var ws: cross.c.struct_winsize = .{
-                .ws_row = resize.rows,
-                .ws_col = resize.cols,
-                .ws_xpixel = resize.xpixel,
-                .ws_ypixel = resize.ypixel,
-            };
-            _ = cross.c.ioctl(pty_fd, cross.c.TIOCSWINSZ, &ws);
+            io.resize(resize);
             // Disable prompt_redraw before resize. The daemon's internal terminal
             // would otherwise clear prompt lines expecting the shell to redraw them,
             // but the shell's redraw goes to the PTY (forwarded to clients), not to
@@ -1116,18 +1265,122 @@ const Daemon = struct {
     pub fn handleKill(self: *Daemon) void {
         std.log.info("kill received session={s}", .{self.session_name});
         self.shutdown();
-        // gracefully shutdown shell processes, shells tend to ignore SIGTERM so we send SIGHUP
-        // instead
-        //   https://www.gnu.org/software/bash/manual/html_node/Signals.html
-        // negative pid means kill process and children
-        std.log.info("sending SIGHUP session={s} pid={d}", .{ self.session_name, self.pid });
-        posix.kill(-self.pid, posix.SIG.HUP) catch |err| {
-            std.log.warn("failed to send SIGHUP to pty child err={s}", .{@errorName(err)});
-        };
-        compat.sleep(500 * std.time.ns_per_ms);
-        posix.kill(-self.pid, posix.SIG.KILL) catch |err| {
-            std.log.warn("failed to send SIGKILL to pty child err={s}", .{@errorName(err)});
-        };
+        self.child.finish(ChildCleanupIo{});
+    }
+
+    /// Runs after the first producer EOF, never polling the dead PTY/listener.
+    /// Only cancellation messages are accepted; final queues cannot be extended
+    /// by new Init/Info/application work after the producer has ended.
+    fn drainFinalOutput(
+        self: *Daemon,
+        window: *const FinalOutputWindow,
+        poll_fds: *std.ArrayList(posix.pollfd),
+        io: anytype,
+    ) !void {
+        while (self.clients.items.len > 0) {
+            var index = self.clients.items.len;
+            while (index > 0) {
+                index -= 1;
+                const client = self.clients.items[index];
+                if (client.write_buf.items.len == 0)
+                    io.closeClient(self, client, index, .drained);
+            }
+            if (self.clients.items.len == 0) return;
+            const timeout_ms = window.remainingMs(io.now());
+            if (timeout_ms == 0) {
+                self.closeFinalOutput(io, .deadline);
+                return;
+            }
+
+            poll_fds.clearRetainingCapacity();
+            // Reuse the live loop's capacity (listener + PTY + signal + clients).
+            // The drain needs only signal + clients, including a just-accepted
+            // client, so no allocation is needed after EOF.
+            poll_fds.appendAssumeCapacity(.{ .fd = io.signal_fd, .events = posix.POLL.IN, .revents = 0 });
+            for (self.clients.items) |client| {
+                poll_fds.appendAssumeCapacity(.{
+                    .fd = client.socket_fd,
+                    .events = posix.POLL.OUT | @as(i16, if (client.drain_read_closed) 0 else posix.POLL.IN),
+                    .revents = 0,
+                });
+            }
+            try io.poll(poll_fds.items, timeout_ms);
+            if (poll_fds.items[0].revents & posix.POLL.IN != 0) {
+                self.closeFinalOutput(io, .cancelled);
+                return;
+            }
+            if (poll_fds.items[0].revents != 0) return error.InvalidSignalPipe;
+            index = self.clients.items.len;
+            clients: while (index > 0) {
+                if (window.remainingMs(io.now()) == 0) {
+                    self.closeFinalOutput(io, .deadline);
+                    return;
+                }
+                index -= 1;
+                const client = self.clients.items[index];
+                const events = poll_fds.items[index + 1].revents;
+                if (events & (posix.POLL.ERR | posix.POLL.NVAL | posix.POLL.HUP) != 0) {
+                    io.closeClient(self, client, index, .peer_failure);
+                    continue;
+                }
+                if (events & posix.POLL.IN != 0) {
+                    const n: ?usize = io.read(client) catch |err| blk: {
+                        if (err == error.WouldBlock) break :blk null;
+                        if (err == error.ConnectionResetByPeer or err == error.BrokenPipe) {
+                            io.closeClient(self, client, index, .peer_failure);
+                            continue :clients;
+                        }
+                        // A local read-buffer failure is not evidence that
+                        // queued output cannot drain. Disable further input
+                        // (avoiding a busy loop), but preserve the output.
+                        std.log.warn("final output input disabled fd={d} err={s}", .{
+                            client.socket_fd, @errorName(err),
+                        });
+                        client.drain_read_closed = true;
+                        break :blk null;
+                    };
+                    if (n == 0) client.drain_read_closed = true;
+                    while (client.read_buf.next()) |msg| {
+                        switch (msg.header.tag) {
+                            .Detach => {
+                                io.closeClient(self, client, index, .cancelled);
+                                continue :clients;
+                            },
+                            .DetachAll, .Kill => {
+                                self.closeFinalOutput(io, .cancelled);
+                                return;
+                            },
+                            else => std.log.debug("ignoring IPC after producer EOF tag={d}", .{@intFromEnum(msg.header.tag)}),
+                        }
+                    }
+                }
+                if (events & posix.POLL.OUT != 0) {
+                    if (window.remainingMs(io.now()) == 0) {
+                        self.closeFinalOutput(io, .deadline);
+                        return;
+                    }
+                    const n = io.write(client.socket_fd, client.write_buf.items) catch |err| {
+                        if (err == error.WouldBlock) continue;
+                        io.closeClient(self, client, index, .peer_failure);
+                        continue;
+                    };
+                    if (n == 0) {
+                        io.closeClient(self, client, index, .peer_failure);
+                        continue;
+                    }
+                    client.write_buf.replaceRange(self.alloc, 0, n, &.{}) catch unreachable;
+                    if (client.write_buf.items.len == 0)
+                        io.closeClient(self, client, index, .drained);
+                }
+            }
+        }
+    }
+
+    fn closeFinalOutput(self: *Daemon, io: anytype, reason: FinalOutputClose) void {
+        while (self.clients.items.len > 0) {
+            const index = self.clients.items.len - 1;
+            io.closeClient(self, self.clients.items[index], index, reason);
+        }
     }
 
     pub fn handleInfo(self: *Daemon, client: *Client) !void {
@@ -1235,8 +1488,9 @@ const Daemon = struct {
         vt_stream.nextSlice(payload);
         self.has_pty_output = true;
         for (self.clients.items) |client| {
-            try ipc.appendMessage(self.alloc, &client.write_buf, .Output, payload);
-            client.has_pending_output = true;
+            if (try client.admission.output(self.alloc, &client.write_buf, payload)) {
+                client.has_pending_output = true;
+            }
         }
         if (self.clients.items.len > 0) {
             posix.kill(self.pid, posix.SIG.WINCH) catch |err| {
@@ -1296,9 +1550,527 @@ const Daemon = struct {
     }
 };
 
+test "attachment: setup failures reject only the attaching client" {
+    const testing = std.testing;
+    const Observed = struct {
+        rejected: ?anyerror = null,
+        closed_fd: ?i32 = null,
+        queued_at_close: usize = 0,
+        info_at_close: bool = false,
+        resize_calls: usize = 0,
+    };
+    const MemoryIo = struct {
+        observed: *Observed,
+        index: usize,
+
+        fn resize(self: @This(), _: ipc.Resize) void {
+            self.observed.resize_calls += 1;
+        }
+
+        fn closeFd(_: posix.fd_t) void {}
+
+        fn reject(self: @This(), daemon: *Daemon, client: *Client, err: anyerror) void {
+            self.observed.rejected = err;
+            self.observed.closed_fd = client.socket_fd;
+            self.observed.queued_at_close = client.write_buf.items.len;
+            var queued: ipc.SocketBuffer = .{
+                .buf = client.write_buf,
+                .alloc = client.alloc,
+                .head = 0,
+            };
+            while (queued.next()) |msg| {
+                if (msg.header.tag == .Info) self.observed.info_at_close = true;
+            }
+            _ = daemon.closeClientUsing(client, self.index, false, closeFd);
+        }
+    };
+    var saw_serializer_failure = false;
+    var saw_queue_failure = false;
+    var saw_info_failure = false;
+    var saw_continuation_failure = false;
+    var saw_unavailable = false;
+    var saw_success = false;
+    for (0..3) |cut| {
+        for (0..if (cut == 2) @as(usize, 1) else 8) |fail_index| {
+            var source = try ghostty_vt.Terminal.init(std.Options.debug_io, testing.allocator, .{
+                .cols = 80,
+                .rows = 24,
+            });
+            defer source.deinit(testing.allocator);
+            var stream = attachment.trackedStream(testing.allocator, &source, if (cut == 2) 4 else 1024);
+            defer stream.deinit();
+            stream.nextSlice("\x1b[?2026hRETAINED");
+            if (cut == 1) stream.nextSlice("\x1b[31");
+            if (cut == 2) stream.nextSlice("\x1b[123");
+            var cfg: Cfg = .{ .socket_dir = "", .log_dir = "" };
+            var daemon: Daemon = .{
+                .cfg = &cfg,
+                .alloc = testing.allocator,
+                .clients = .empty,
+                .leader_client_fd = 101,
+                .session_name = "fixture",
+                .socket_path = "",
+                .running = true,
+                .pid = 0,
+                .has_pty_output = true,
+                .has_had_client = true,
+                .has_terminal_client = true,
+                .created_at = 0,
+            };
+            defer {
+                for (daemon.clients.items) |client| {
+                    client.deinitBuffers();
+                    testing.allocator.destroy(client);
+                }
+                daemon.clients.deinit(testing.allocator);
+                daemon.pty_write_buf.deinit(testing.allocator);
+            }
+            for ([_]i32{ 101, 102 }) |fd| {
+                const client = try testing.allocator.create(Client);
+                client.* = .{
+                    .alloc = testing.allocator,
+                    .socket_fd = fd,
+                    .read_buf = try ipc.SocketBuffer.init(testing.allocator),
+                    .write_buf = .empty,
+                };
+                try daemon.clients.append(testing.allocator, client);
+            }
+            const existing = daemon.clients.items[0];
+            try existing.write_buf.ensureTotalCapacity(testing.allocator, 4096);
+            const attaching = daemon.clients.items[1];
+            attaching.admission.begin();
+            const size: ipc.Resize = .{ .cols = 80, .rows = 24 };
+            // A later Info is in the same batch. The dispatcher must reject the
+            // client and return false before the caller can handle or flush it.
+            try ipc.appendMessage(testing.allocator, &attaching.read_buf.buf, .Info, "");
+            var failing = testing.FailingAllocator.init(testing.allocator, .{ .fail_index = fail_index });
+            daemon.alloc = failing.allocator();
+            var observed: Observed = .{};
+            const memory_io: MemoryIo = .{
+                .observed = &observed,
+                .index = 1,
+            };
+            const initialized = daemon.dispatchInit(attaching, &source, &stream, std.mem.asBytes(&size), memory_io);
+            var accepted = initialized;
+            if (initialized) {
+                const next = attaching.read_buf.next().?;
+                try testing.expectEqual(ipc.Tag.Info, next.header.tag);
+                accepted = daemon.dispatchInfo(attaching, memory_io);
+            }
+            if (accepted) {
+                saw_success = true;
+                try testing.expect(observed.rejected == null);
+                continue;
+            }
+            const failure = observed.rejected.?;
+            saw_serializer_failure = saw_serializer_failure or failure == error.TerminalRestoreFailed;
+            saw_queue_failure = saw_queue_failure or (!initialized and failure == error.OutOfMemory);
+            saw_info_failure = saw_info_failure or initialized;
+            saw_continuation_failure = saw_continuation_failure or failure == error.WriteFailed;
+            saw_unavailable = saw_unavailable or failure == error.ContinuationUnavailable;
+            try testing.expectEqual(@as(?i32, 102), observed.closed_fd);
+            if (!initialized) try testing.expectEqual(@as(usize, 0), observed.queued_at_close);
+            try testing.expect(!observed.info_at_close);
+            try testing.expectEqual(@as(usize, 0), observed.resize_calls);
+            try testing.expect(daemon.running);
+            try testing.expectEqual(@as(usize, 1), daemon.clients.items.len);
+            try testing.expectEqual(existing, daemon.clients.items[0]);
+            try testing.expectEqual(@as(?i32, 101), daemon.leader_client_fd);
+            try testing.expect(daemon.has_terminal_client and daemon.has_had_client);
+            try testing.expect(source.modes.get(.synchronized_output));
+            try testing.expect(try existing.admission.output(daemon.alloc, &existing.write_buf, "still live"));
+        }
+    }
+    try testing.expect(saw_serializer_failure);
+    try testing.expect(saw_queue_failure);
+    try testing.expect(saw_info_failure);
+    try testing.expect(saw_continuation_failure);
+    try testing.expect(saw_unavailable);
+    try testing.expect(saw_success);
+}
+
+// The same producer-side loop runs below with memory transport and an injected
+// clock. No sockets, PTYs, signals, sleeps, or child processes are used.
+const FinalOutputFixture = struct {
+    const testing = std.testing;
+    const Write = union(enum) { limit: usize, again, broken };
+    const Read = enum { eof, out_of_memory, detach, kill, info };
+    const Step = struct {
+        at_ns: i96,
+        events: [2]i16 = .{ posix.POLL.OUT, posix.POLL.OUT },
+        writes: [2]Write = .{ .{ .limit = 1_000_000 }, .{ .limit = 1_000_000 } },
+        reads: [2]Read = .{ .eof, .eof },
+        repeat_eof: bool = false,
+        cancel: bool = false,
+    };
+    const Peer = struct {
+        handed: std.ArrayList(u8) = .empty,
+        reason: ?FinalOutputClose = null,
+        unsent: usize = 0,
+        closed_at: i96 = 0,
+        writes: usize = 0,
+        reads: usize = 0,
+        input_closed: bool = false,
+    };
+
+    cfg: Cfg = .{ .socket_dir = "", .log_dir = "" },
+    daemon: Daemon = undefined,
+    window: FinalOutputWindow = .{},
+    polls: std.ArrayList(posix.pollfd) = .empty,
+    peers: [2]Peer = .{ .{}, .{} },
+    signal_fd: posix.fd_t = 900,
+    time_ns: i96 = 0,
+    steps: []const Step = &.{},
+    next_step: usize = 0,
+    timeouts: [16]i32 = undefined,
+    half_close_observed: bool = false,
+
+    fn init(self: *@This(), steps: []const Step) !void {
+        self.* = .{ .steps = steps };
+        self.daemon = .{
+            .cfg = &self.cfg,
+            .alloc = testing.allocator,
+            .clients = .empty,
+            .leader_client_fd = 101,
+            .session_name = "fixture",
+            .socket_path = "",
+            .running = true,
+            .pid = 123,
+            .created_at = 0,
+            .child = .{ .pid = 123 },
+        };
+        self.polls = try .initCapacity(testing.allocator, 8);
+        for ([_]i32{ 101, 102 }) |fd| {
+            const client = try testing.allocator.create(Client);
+            client.* = .{
+                .alloc = testing.allocator,
+                .socket_fd = fd,
+                .read_buf = try ipc.SocketBuffer.init(testing.allocator),
+                .write_buf = .empty,
+            };
+            try self.daemon.clients.append(testing.allocator, client);
+        }
+        self.window.observeEof(0);
+    }
+
+    fn deinit(self: *@This()) void {
+        for (self.daemon.clients.items) |client| {
+            client.deinitBuffers();
+            testing.allocator.destroy(client);
+        }
+        self.daemon.clients.deinit(testing.allocator);
+        self.polls.deinit(testing.allocator);
+        for (&self.peers) |*peer| peer.handed.deinit(testing.allocator);
+    }
+
+    fn queue(self: *@This(), peer: usize, data: []const u8, info: bool) ![]u8 {
+        const client = self.daemon.clients.items[peer];
+        try ipc.appendMessage(testing.allocator, &client.write_buf, .Output, data);
+        if (info) try self.daemon.handleInfo(client);
+        return testing.allocator.dupe(u8, client.write_buf.items);
+    }
+
+    fn run(self: *@This()) !void {
+        try self.daemon.drainFinalOutput(&self.window, &self.polls, self);
+        try testing.expectEqual(@as(usize, 0), self.daemon.clients.items.len);
+        try testing.expectEqual(@as(?posix.pid_t, 123), self.daemon.child.pid);
+        try testing.expectEqual(@as(?i96, FinalOutputWindow.duration_ns), self.window.deadline_ns);
+    }
+
+    fn now(self: *@This()) i96 {
+        return self.time_ns;
+    }
+
+    fn poll(self: *@This(), fds: []posix.pollfd, timeout_ms: i32) !void {
+        try testing.expect(self.next_step < self.steps.len);
+        try testing.expect(timeout_ms > 0 and timeout_ms <= 5000);
+        self.timeouts[self.next_step] = timeout_ms;
+        const step = self.steps[self.next_step];
+        self.next_step += 1;
+        self.time_ns = step.at_ns;
+        if (step.repeat_eof) self.window.observeEof(self.time_ns);
+        try testing.expectEqual(self.signal_fd, fds[0].fd);
+        fds[0].revents = if (step.cancel) posix.POLL.IN else 0;
+        for (fds[1..]) |*fd| {
+            // In particular, neither the dead PTY nor the listener is polled.
+            try testing.expect(fd.fd == 101 or fd.fd == 102);
+            const peer: usize = @intCast(fd.fd - 101);
+            try testing.expect(self.peers[peer].reason == null);
+            if (self.peers[peer].input_closed) {
+                try testing.expect(fd.events & posix.POLL.IN == 0);
+                self.half_close_observed = true;
+            }
+            fd.revents = step.events[peer];
+        }
+    }
+
+    fn read(self: *@This(), client: *Client) !usize {
+        const peer: usize = @intCast(client.socket_fd - 101);
+        self.peers[peer].reads += 1;
+        const action = self.steps[self.next_step - 1].reads[peer];
+        const tag: ipc.Tag = switch (action) {
+            .eof => {
+                self.peers[peer].input_closed = true;
+                return 0;
+            },
+            .out_of_memory => {
+                self.peers[peer].input_closed = true;
+                return error.OutOfMemory;
+            },
+            .detach => .Detach,
+            .kill => .Kill,
+            .info => .Info,
+        };
+        try ipc.appendMessage(testing.allocator, &client.read_buf.buf, tag, "");
+        return @sizeOf(ipc.Header);
+    }
+
+    fn write(self: *@This(), fd: posix.fd_t, bytes: []const u8) !usize {
+        const peer: usize = @intCast(fd - 101);
+        self.peers[peer].writes += 1;
+        const n = switch (self.steps[self.next_step - 1].writes[peer]) {
+            .limit => |limit| @min(limit, bytes.len),
+            .again => return error.WouldBlock,
+            .broken => return error.BrokenPipe,
+        };
+        try self.peers[peer].handed.appendSlice(testing.allocator, bytes[0..n]);
+        return n;
+    }
+
+    fn closeFd(_: posix.fd_t) void {}
+
+    fn closeClient(self: *@This(), daemon: *Daemon, client: *Client, index: usize, reason: FinalOutputClose) void {
+        const peer: usize = @intCast(client.socket_fd - 101);
+        std.debug.assert(self.peers[peer].reason == null);
+        self.peers[peer].reason = reason;
+        self.peers[peer].unsent = client.write_buf.items.len;
+        self.peers[peer].closed_at = self.time_ns;
+        _ = daemon.closeClientUsing(client, index, false, closeFd);
+    }
+};
+
+test "drain: production loop handles partial writes and EAGAIN independently" {
+    const testing = std.testing;
+    var fixture: FinalOutputFixture = undefined;
+    try fixture.init(&.{
+        .{ .at_ns = 0, .writes = .{ .{ .limit = 7 }, .again } },
+        .{ .at_ns = std.time.ns_per_s, .writes = .{ .{ .limit = 10000 }, .again } },
+        .{ .at_ns = 2 * std.time.ns_per_s, .writes = .{ .again, .{ .limit = 11 } } },
+        .{ .at_ns = 3 * std.time.ns_per_s },
+    });
+    defer fixture.deinit();
+    const first = try fixture.queue(0, "healthy", true);
+    defer testing.allocator.free(first);
+    const second = try fixture.queue(1, "final output " ** 600, true);
+    defer testing.allocator.free(second);
+    try fixture.run();
+    try testing.expectEqualSlices(u8, first, fixture.peers[0].handed.items);
+    try testing.expectEqualSlices(u8, second, fixture.peers[1].handed.items);
+    try testing.expectEqual(@as(i96, std.time.ns_per_s), fixture.peers[0].closed_at);
+    try testing.expectEqual(@as(i96, 3 * std.time.ns_per_s), fixture.peers[1].closed_at);
+    for (fixture.peers) |peer| {
+        try testing.expectEqual(FinalOutputClose.drained, peer.reason.?);
+        try testing.expectEqual(@as(usize, 0), peer.unsent);
+    }
+}
+
+test "drain: exact expiry is fixed across repeated EOF and progress" {
+    const testing = std.testing;
+    const end = FinalOutputWindow.duration_ns;
+    var fixture: FinalOutputFixture = undefined;
+    try fixture.init(&.{
+        .{ .at_ns = 2 * std.time.ns_per_s, .writes = .{ .{ .limit = 1 }, .again }, .repeat_eof = true },
+        .{ .at_ns = end - 1, .writes = .{ .{ .limit = 1 }, .again }, .repeat_eof = true },
+        .{ .at_ns = end, .repeat_eof = true },
+    });
+    defer fixture.deinit();
+    inline for (0..2) |index| {
+        const data = try fixture.queue(index, "unfinished", true);
+        testing.allocator.free(data);
+    }
+    try fixture.run();
+    try testing.expectEqualSlices(i32, &.{ 5000, 3000, 1 }, fixture.timeouts[0..3]);
+    try testing.expectEqual(@as(usize, 2), fixture.peers[0].handed.items.len);
+    for (fixture.peers) |peer| {
+        try testing.expectEqual(FinalOutputClose.deadline, peer.reason.?);
+        try testing.expectEqual(@as(i96, end), peer.closed_at);
+        try testing.expect(peer.unsent > 0);
+        try testing.expectEqual(@as(usize, 2), peer.writes);
+    }
+}
+
+test "drain: empty queues close without polling or waiting" {
+    var fixture: FinalOutputFixture = undefined;
+    try fixture.init(&.{});
+    defer fixture.deinit();
+    try fixture.run();
+    try std.testing.expectEqual(@as(usize, 0), fixture.next_step);
+    for (fixture.peers) |peer| try std.testing.expectEqual(FinalOutputClose.drained, peer.reason.?);
+}
+
+test "drain: interrupted waits keep the original deadline" {
+    const testing = std.testing;
+    var fixture: FinalOutputFixture = undefined;
+    try fixture.init(&.{
+        .{ .at_ns = 2 * std.time.ns_per_s, .events = .{ 0, 0 } },
+        .{ .at_ns = FinalOutputWindow.duration_ns, .events = .{ 0, 0 } },
+    });
+    defer fixture.deinit();
+    const data = try fixture.queue(0, "pending", true);
+    defer testing.allocator.free(data);
+    try fixture.run();
+    try testing.expectEqualSlices(i32, &.{ 5000, 3000 }, fixture.timeouts[0..2]);
+    try testing.expectEqual(@as(usize, 0), fixture.peers[0].writes);
+    try testing.expectEqual(FinalOutputClose.deadline, fixture.peers[0].reason.?);
+}
+
+test "drain: an already expired window writes nothing" {
+    var fixture: FinalOutputFixture = undefined;
+    try fixture.init(&.{});
+    defer fixture.deinit();
+    const data = try fixture.queue(0, "queued", true);
+    defer std.testing.allocator.free(data);
+    fixture.time_ns = FinalOutputWindow.duration_ns;
+    try fixture.run();
+    try std.testing.expectEqual(@as(usize, 0), fixture.next_step);
+    try std.testing.expectEqual(@as(usize, 0), fixture.peers[0].writes);
+    try std.testing.expectEqual(FinalOutputClose.deadline, fixture.peers[0].reason.?);
+    try std.testing.expectEqual(FinalOutputClose.drained, fixture.peers[1].reason.?);
+}
+
+test "drain: truncated producer snapshot at expiry never supplies Info readiness" {
+    const testing = std.testing;
+    var fixture: FinalOutputFixture = undefined;
+    try fixture.init(&.{
+        .{ .at_ns = 0, .writes = .{ .{ .limit = 4096 }, .{ .limit = 10000 } } },
+        .{ .at_ns = FinalOutputWindow.duration_ns },
+    });
+    defer fixture.deinit();
+    var term = try ghostty_vt.Terminal.init(std.Options.debug_io, testing.allocator, .{
+        .cols = 80,
+        .rows = 24,
+        .max_scrollback_bytes = 1_000_000,
+    });
+    defer term.deinit(testing.allocator);
+    var stream = attachment.trackedStream(testing.allocator, &term, 1024);
+    defer stream.deinit();
+    stream.nextSlice("retained output for final snapshot\r\n" ** 300);
+    const client = fixture.daemon.clients.items[0];
+    client.admission.begin();
+    try testing.expect(try client.admission.prepareInit(
+        testing.allocator,
+        &client.write_buf,
+        &term,
+        &stream,
+        true,
+        false,
+        24,
+    ));
+    try fixture.daemon.handleInfo(client);
+    const healthy = try fixture.queue(1, "healthy", true);
+    defer testing.allocator.free(healthy);
+    try fixture.run();
+    try testing.expect(fixture.peers[0].unsent > 0);
+    try testing.expectEqualSlices(u8, healthy, fixture.peers[1].handed.items);
+    var decoder = try ipc.SocketBuffer.init(testing.allocator);
+    defer decoder.deinit();
+    try decoder.buf.appendSlice(testing.allocator, fixture.peers[0].handed.items);
+    var receiver: attachment.Receiver = .{};
+    var output: std.ArrayList(u8) = .empty;
+    defer output.deinit(testing.allocator);
+    while (decoder.next()) |msg| try receiver.receive(testing.allocator, &output, msg);
+    try testing.expect(receiver.boundary_received);
+    try testing.expect(!receiver.ready);
+    try testing.expectEqual(@as(usize, 0), output.items.len);
+}
+
+test "drain: peer failure and explicit cancellation preserve other clients" {
+    const testing = std.testing;
+    const cases = [_]FinalOutputFixture.Step{
+        .{ .at_ns = 0, .writes = .{ .broken, .{ .limit = 10000 } } },
+        .{ .at_ns = 0, .events = .{ posix.POLL.IN, posix.POLL.OUT }, .reads = .{ .detach, .eof } },
+        .{ .at_ns = 0, .events = .{ posix.POLL.HUP, posix.POLL.OUT } },
+        .{ .at_ns = 0, .cancel = true },
+        .{ .at_ns = 0, .events = .{ 0, posix.POLL.IN }, .reads = .{ .eof, .kill } },
+    };
+    for (cases, 0..) |step, case| {
+        var fixture: FinalOutputFixture = undefined;
+        try fixture.init(&.{step});
+        defer fixture.deinit();
+        inline for (0..2) |peer| {
+            const data = try fixture.queue(peer, "pending", true);
+            testing.allocator.free(data);
+        }
+        try fixture.run();
+        const expected: FinalOutputClose = if (case == 0 or case == 2) .peer_failure else .cancelled;
+        try testing.expectEqual(expected, fixture.peers[0].reason.?);
+        try testing.expect(fixture.peers[0].unsent > 0);
+        try testing.expectEqual(if (case < 3) FinalOutputClose.drained else .cancelled, fixture.peers[1].reason.?);
+    }
+}
+
+test "drain: half close and post-EOF work cannot extend queues or readiness" {
+    const testing = std.testing;
+    for ([_]FinalOutputFixture.Read{ .eof, .out_of_memory }) |read_action| {
+        var fixture: FinalOutputFixture = undefined;
+        try fixture.init(&.{
+            .{ .at_ns = 0, .events = .{ posix.POLL.IN, posix.POLL.IN }, .reads = .{ read_action, .info } },
+            .{ .at_ns = std.time.ns_per_s },
+        });
+        defer fixture.deinit();
+        inline for (0..2) |peer| {
+            const data = try fixture.queue(peer, "final bytes", false);
+            testing.allocator.free(data);
+        }
+        try fixture.run();
+        try testing.expect(fixture.half_close_observed);
+        for (fixture.peers) |peer| {
+            try testing.expectEqual(@as(usize, 1), peer.reads);
+            var decoder = try ipc.SocketBuffer.init(testing.allocator);
+            defer decoder.deinit();
+            try decoder.buf.appendSlice(testing.allocator, peer.handed.items);
+            try testing.expectEqual(ipc.Tag.Output, decoder.next().?.header.tag);
+            try testing.expect(decoder.next() == null);
+        }
+    }
+}
+
+test "drain: child identity is retained through final signal and reaped once" {
+    const Recorder = struct {
+        const Event = enum { hup, grace, kill, reap };
+        events: [4]Event = undefined,
+        count: usize = 0,
+        child: *RetainedChild,
+
+        fn record(self: *@This(), event: Event) void {
+            std.debug.assert(self.child.pid == 123);
+            self.events[self.count] = event;
+            self.count += 1;
+        }
+        fn signalGroup(self: *@This(), pid: posix.pid_t, signal: posix.SIG) void {
+            std.debug.assert(pid == 123);
+            self.record(if (signal == .HUP) .hup else .kill);
+        }
+        fn grace(self: *@This()) void {
+            self.record(.grace);
+        }
+        fn reap(self: *@This(), pid: posix.pid_t) void {
+            std.debug.assert(pid == 123);
+            self.record(.reap);
+        }
+    };
+    var child: RetainedChild = .{ .pid = 123 };
+    var recorder: Recorder = .{ .child = &child };
+    child.finish(&recorder);
+    try std.testing.expectEqualSlices(Recorder.Event, &.{ .hup, .grace, .kill, .reap }, &recorder.events);
+    try std.testing.expect(child.pid == null);
+    child.finish(&recorder);
+    try std.testing.expectEqual(@as(usize, 4), recorder.count);
+}
+
 fn printVersion(cfg: *Cfg) !void {
     var buf: [256]u8 = undefined;
-    var w = std.Io.File.stdout().writer(std.Options.debug_io, &buf);
+    var w = std.Io.File.stdout().writerStreaming(std.Options.debug_io, &buf);
     var ver = version;
     if (builtin.mode == .Debug) {
         ver = git_sha;
@@ -1313,14 +2085,14 @@ fn printVersion(cfg: *Cfg) !void {
 fn printCompletions(shell: completions.Shell) !void {
     const script = shell.getCompletionScript();
     var buf: [8192]u8 = undefined;
-    var w = std.Io.File.stdout().writer(std.Options.debug_io, &buf);
+    var w = std.Io.File.stdout().writerStreaming(std.Options.debug_io, &buf);
     try w.interface.print("{s}\n", .{script});
     try w.interface.flush();
 }
 
 fn cliUsageError(message: []const u8) noreturn {
     var buf: [512]u8 = undefined;
-    var w = std.Io.File.stderr().writer(std.Options.debug_io, &buf);
+    var w = std.Io.File.stderr().writerStreaming(std.Options.debug_io, &buf);
     w.interface.print("error: {s}\n", .{message}) catch {};
     w.interface.flush() catch {};
     std.process.exit(2);
@@ -1328,7 +2100,7 @@ fn cliUsageError(message: []const u8) noreturn {
 
 fn printCapabilities() !void {
     var buf: [128]u8 = undefined;
-    var w = std.Io.File.stdout().writer(std.Options.debug_io, &buf);
+    var w = std.Io.File.stdout().writerStreaming(std.Options.debug_io, &buf);
     try w.interface.writeAll("zmx-capabilities-v1\nresume\npreserve-scrollback\n");
     try w.interface.flush();
 }
@@ -1485,7 +2257,7 @@ fn help() !void {
         \\
     ;
     var buf: [8192]u8 = undefined;
-    var w = std.Io.File.stdout().writer(std.Options.debug_io, &buf);
+    var w = std.Io.File.stdout().writerStreaming(std.Options.debug_io, &buf);
     try w.interface.print(help_text, .{});
     try w.interface.flush();
 }
@@ -1653,11 +2425,11 @@ fn wait(cfg: *Cfg, matchers: std.ArrayList(SessionMatch)) !void {
     const alloc = gpa.allocator();
 
     var stdout_buffer: [1024]u8 = undefined;
-    var stdout_writer = std.Io.File.stdout().writer(std.Options.debug_io, &stdout_buffer);
+    var stdout_writer = std.Io.File.stdout().writerStreaming(std.Options.debug_io, &stdout_buffer);
     const stdout = &stdout_writer.interface;
 
     var stderr_buffer: [1024]u8 = undefined;
-    var stderr_writer = std.Io.File.stderr().writer(std.Options.debug_io, &stderr_buffer);
+    var stderr_writer = std.Io.File.stderr().writerStreaming(std.Options.debug_io, &stderr_buffer);
     const stderr = &stderr_writer.interface;
 
     // Highest match count seen so far. Lets us distinguish "sessions haven't
@@ -1836,7 +2608,7 @@ fn list(cfg: *Cfg, short: bool) !void {
 
     const current_session = socket.getSeshNameFromEnv();
     var buf: [4096]u8 = undefined;
-    var stdout = std.Io.File.stdout().writer(std.Options.debug_io, &buf);
+    var stdout = std.Io.File.stdout().writerStreaming(std.Options.debug_io, &buf);
 
     var sessions = try util.get_session_entries(alloc, cfg.socket_dir);
     defer {
@@ -1849,7 +2621,7 @@ fn list(cfg: *Cfg, short: bool) !void {
     if (sessions.items.len == 0) {
         if (short) return;
         var errbuf: [4096]u8 = undefined;
-        var stderr = std.Io.File.stderr().writer(std.Options.debug_io, &errbuf);
+        var stderr = std.Io.File.stderr().writerStreaming(std.Options.debug_io, &errbuf);
         try stderr.interface.print("no sessions found in {s}\n", .{cfg.socket_dir});
         try stderr.interface.flush();
         return;
@@ -1910,7 +2682,7 @@ fn kill(cfg: *Cfg, session_name: []const u8, force: bool) !void {
     const exists = try socket.sessionExists(dir, session_name);
     if (!exists) {
         var buf: [4096]u8 = undefined;
-        var w = std.Io.File.stderr().writer(std.Options.debug_io, &buf);
+        var w = std.Io.File.stderr().writerStreaming(std.Options.debug_io, &buf);
         w.interface.print("error: session \"{s}\" does not exist\n", .{session_name}) catch {};
         w.interface.flush() catch {};
         return error.SessionNotFound;
@@ -1918,7 +2690,7 @@ fn kill(cfg: *Cfg, session_name: []const u8, force: bool) !void {
     const fd = ipc.connectSession(socket_path) catch |err| {
         std.log.err("session unresponsive: {s}", .{@errorName(err)});
         var buf: [4096]u8 = undefined;
-        var w = std.Io.File.stdout().writer(std.Options.debug_io, &buf);
+        var w = std.Io.File.stdout().writerStreaming(std.Options.debug_io, &buf);
         if (force or err == error.ConnectionRefused) {
             socket.cleanupStaleSocket(dir, session_name);
             w.interface.print("cleaned up stale session {s}\n", .{session_name}) catch {};
@@ -1950,7 +2722,7 @@ fn kill(cfg: *Cfg, session_name: []const u8, force: bool) !void {
     }
 
     var buf: [100]u8 = undefined;
-    var w = std.Io.File.stdout().writer(std.Options.debug_io, &buf);
+    var w = std.Io.File.stdout().writerStreaming(std.Options.debug_io, &buf);
     try w.interface.print("killed session {s}\n", .{session_name});
     try w.interface.flush();
 }
@@ -2036,7 +2808,7 @@ fn history(cfg: *Cfg, session_name: []const u8, format: util.HistoryFormat) !voi
     const exists = try socket.sessionExists(dir, session_name);
     if (!exists) {
         var buf: [4096]u8 = undefined;
-        var w = std.Io.File.stderr().writer(std.Options.debug_io, &buf);
+        var w = std.Io.File.stderr().writerStreaming(std.Options.debug_io, &buf);
         w.interface.print("error: session \"{s}\" does not exist\n", .{session_name}) catch {};
         w.interface.flush() catch {};
         return error.SessionNotFound;
@@ -2094,7 +2866,7 @@ fn switchSesh(daemon: *Daemon, current_sesh: []const u8) !void {
     const exists = try socket.sessionExists(dir, current_sesh);
     if (!exists) {
         var buf: [4096]u8 = undefined;
-        var w = std.Io.File.stderr().writer(std.Options.debug_io, &buf);
+        var w = std.Io.File.stderr().writerStreaming(std.Options.debug_io, &buf);
         w.interface.print("error: session \"{s}\" does not exist\n", .{current_sesh}) catch {};
         w.interface.flush() catch {};
         return error.SessionNotFound;
@@ -2240,7 +3012,7 @@ fn attachConnected(client_sock: i32) !ClientResult {
 
 fn writeFile(daemon: *Daemon, file_path: []const u8) !void {
     var buf: [4096]u8 = undefined;
-    var w = std.Io.File.stdout().writer(std.Options.debug_io, &buf);
+    var w = std.Io.File.stdout().writerStreaming(std.Options.debug_io, &buf);
     const sesh_result = try daemon.ensureSession();
     if (sesh_result.is_daemon) return;
 
@@ -2329,7 +3101,7 @@ fn writeFile(daemon: *Daemon, file_path: []const u8) !void {
 fn send(cfg: *Cfg, session_name: []const u8, socket_path: []const u8, text_parts: [][]const u8, tag: ipc.Tag) !void {
     const alloc = std.heap.c_allocator;
     var buf: [4096]u8 = undefined;
-    var w = std.Io.File.stdout().writer(std.Options.debug_io, &buf);
+    var w = std.Io.File.stdout().writerStreaming(std.Options.debug_io, &buf);
 
     var payload = std.ArrayList(u8).empty;
     defer payload.deinit(alloc);
@@ -2391,7 +3163,7 @@ fn send(cfg: *Cfg, session_name: []const u8, socket_path: []const u8, text_parts
 fn run(daemon: *Daemon, detached: bool, command_args: [][]const u8) !void {
     const alloc = daemon.alloc;
     var buf: [4096]u8 = undefined;
-    var w = std.Io.File.stdout().writer(std.Options.debug_io, &buf);
+    var w = std.Io.File.stdout().writerStreaming(std.Options.debug_io, &buf);
 
     var cmd_to_send: ?[]const u8 = null;
     var allocated_cmd: ?[]u8 = null;
@@ -2519,12 +3291,11 @@ fn clientLoop(client_sock_fd: i32) !ClientResult {
 
     // Send init message with terminal size (buffered)
     const size = ipc.getTerminalSize(posix.STDOUT_FILENO);
-    try ipc.appendMessage(alloc, &sock_write_buf, .Init, std.mem.asBytes(&size));
+    try attachment.request(alloc, &sock_write_buf, size);
     // Info is supported by existing daemons and ordered after Init on this
     // same connection. Its response distinguishes attachment from an early
     // EOF, including when an empty session has nothing to restore.
-    try ipc.appendMessage(alloc, &sock_write_buf, .Info, "");
-    var ready = false;
+    var restoration: attachment.Receiver = .{};
     var socket_eof = false;
     var socket_write_open = true;
 
@@ -2554,7 +3325,7 @@ fn clientLoop(client_sock_fd: i32) !ClientResult {
 
     while (true) {
         if (socket_eof and stdout_buf.items.len == 0) {
-            return ClientResult{ .kind = if (ready) .detach else .unavailable, .session_name = null };
+            return ClientResult{ .kind = if (restoration.ready) .detach else .unavailable, .session_name = null };
         }
         poll_fds.clearRetainingCapacity();
 
@@ -2577,7 +3348,7 @@ fn clientLoop(client_sock_fd: i32) !ClientResult {
 
         try poll_fds.append(alloc, .{ .fd = sig_pipe[0], .events = posix.POLL.IN, .revents = 0 });
 
-        if (stdout_buf.items.len > 0) {
+        if (stdout_buf.items.len > 0 and restoration.canFlush(socket_eof)) {
             try poll_fds.append(alloc, .{
                 .fd = posix.STDOUT_FILENO,
                 .events = posix.POLL.OUT,
@@ -2620,7 +3391,7 @@ fn clientLoop(client_sock_fd: i32) !ClientResult {
                     }
                 } else {
                     // EOF on stdin
-                    return ClientResult{ .kind = if (ready) .detach else .unavailable, .session_name = null };
+                    return ClientResult{ .kind = if (restoration.ready) .detach else .unavailable, .session_name = null };
                 }
             }
         }
@@ -2643,14 +3414,7 @@ fn clientLoop(client_sock_fd: i32) !ClientResult {
 
             while (read_buf.next()) |msg| {
                 switch (msg.header.tag) {
-                    .Info => {
-                        if (msg.payload.len == @sizeOf(ipc.Info)) ready = true;
-                    },
-                    .Output => {
-                        if (msg.payload.len > 0) {
-                            try stdout_buf.appendSlice(alloc, msg.payload);
-                        }
-                    },
+                    .Attach, .Info, .Output => try restoration.receive(alloc, &stdout_buf, msg),
                     .Resize => {
                         if (!socket_write_open) continue;
                         // daemon is asking for the client's window size usually in response
@@ -2689,7 +3453,7 @@ fn clientLoop(client_sock_fd: i32) !ClientResult {
             }
         }
 
-        if (stdout_buf.items.len > 0) {
+        if (stdout_buf.items.len > 0 and restoration.canFlush(socket_eof)) {
             const n = compat.write(posix.STDOUT_FILENO, stdout_buf.items) catch |err| blk: {
                 if (err == error.WouldBlock) break :blk 0;
                 return err;
@@ -2718,7 +3482,7 @@ fn daemonLoop(daemon: *Daemon, server_sock_fd: i32, pty_fd: i32) !void {
         .max_scrollback_bytes = daemon.cfg.max_scrollback,
     });
     defer term.deinit(daemon.alloc);
-    var vt_stream = term.vtStream();
+    var vt_stream = attachment.trackedStream(daemon.alloc, &term, daemon.cfg.max_scrollback);
     defer vt_stream.deinit();
 
     // Carries the tail of the previous PTY read so the task-exit marker
@@ -2809,17 +3573,19 @@ fn daemonLoop(daemon: *Daemon, server_sock_fd: i32, pty_fd: i32) !void {
             var buf: [4096]u8 = undefined;
             const n_opt: ?usize = posix.read(pty_fd, &buf) catch |err| blk: {
                 if (err == error.WouldBlock) break :blk null;
-                break :blk 0;
+                // Linux reports the closed slave as EIO; other read failures
+                // are errors, not an invented producer EOF.
+                if (err == error.InputOutput) break :blk 0;
+                return err;
             };
 
             if (n_opt) |n| {
                 if (n == 0) {
-                    // EOF: Shell exited
+                    const io: FinalOutputIo = .{ .signal_fd = sig_pipe[0] };
+                    var window: FinalOutputWindow = .{};
+                    window.observeEof(io.now());
                     std.log.info("shell exited pty_fd={d}", .{pty_fd});
-                    // Let the rest of this poll iteration complete so client
-                    // write buffers are flushed via the normal POLLOUT path.
-                    // On the next iteration, daemon.running will be false.
-                    daemon.running = false;
+                    return daemon.drainFinalOutput(&window, &poll_fds, io);
                 } else {
                     // Feed PTY output to terminal emulator for state tracking
                     vt_stream.nextSlice(buf[0..n]);
@@ -2873,14 +3639,14 @@ fn daemonLoop(daemon: *Daemon, server_sock_fd: i32, pty_fd: i32) !void {
                     const broadcast_data = util.rewritePromptRedraw(daemon.alloc, buf[0..n]) orelse buf[0..n];
                     defer if (broadcast_data.ptr != buf[0..n].ptr) daemon.alloc.free(broadcast_data);
                     for (daemon.clients.items) |client| {
-                        ipc.appendMessage(daemon.alloc, &client.write_buf, .Output, broadcast_data) catch |err| {
+                        const queued = client.admission.output(daemon.alloc, &client.write_buf, broadcast_data) catch |err| {
                             std.log.warn(
                                 "failed to buffer output for client err={s}",
                                 .{@errorName(err)},
                             );
                             continue;
                         };
-                        client.has_pending_output = true;
+                        if (queued) client.has_pending_output = true;
                     }
                 }
             }
@@ -2937,9 +3703,21 @@ fn daemonLoop(daemon: *Daemon, server_sock_fd: i32, pty_fd: i32) !void {
 
                 while (client.read_buf.next()) |msg| {
                     switch (msg.header.tag) {
+                        .Attach => {
+                            if (msg.payload.len == 0) {
+                                client.admission.begin();
+                            } else {
+                                std.log.warn("ignoring invalid Attach payload length={d}", .{msg.payload.len});
+                            }
+                        },
                         .Input => try daemon.handleInput(client, msg.payload),
                         .Output => try daemon.handleOutput(msg.payload, &vt_stream),
-                        .Init => try daemon.handleInit(client, pty_fd, &term, msg.payload),
+                        .Init => {
+                            if (!daemon.dispatchInit(client, &term, &vt_stream, msg.payload, ClientInitIo{
+                                .pty_fd = pty_fd,
+                                .index = i,
+                            })) continue :clients_loop;
+                        },
                         .Switch => try daemon.handleSwitch(msg.payload),
                         .Resize => try daemon.handleResize(client, pty_fd, &term, msg.payload),
                         .Detach => {
@@ -2953,7 +3731,12 @@ fn daemonLoop(daemon: *Daemon, server_sock_fd: i32, pty_fd: i32) !void {
                         .Kill => {
                             break :daemon_loop;
                         },
-                        .Info => try daemon.handleInfo(client),
+                        .Info => {
+                            if (!daemon.dispatchInfo(client, ClientInitIo{
+                                .pty_fd = pty_fd,
+                                .index = i,
+                            })) continue :clients_loop;
+                        },
                         .History => try daemon.handleHistory(client, &term, msg.payload),
                         .Run => try daemon.handleRun(client, msg.payload),
                         .Ack, .TaskComplete => {},

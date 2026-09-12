@@ -33,8 +33,15 @@ pub const LogSystem = struct {
     }
 
     pub fn deinit(self: *LogSystem) void {
-        if (self.file) |f| f.close(std.Options.debug_io);
-        if (self.path.len > 0) self.alloc.free(self.path);
+        if (self.file) |f| {
+            f.close(std.Options.debug_io);
+            // std.start reports main's error after main's defers have run.
+            self.file = null;
+        }
+        if (self.path.len > 0) {
+            self.alloc.free(self.path);
+            self.path = "";
+        }
     }
 
     pub fn log(
@@ -111,3 +118,28 @@ pub const LogSystem = struct {
         self.current_size = 0;
     }
 };
+
+test "LogSystem deinit releases ownership and can repeat" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var logger = LogSystem{ .alloc = std.testing.allocator };
+    {
+        logger.path = try std.testing.allocator.dupe(u8, "logger.log");
+        errdefer std.testing.allocator.free(logger.path);
+        logger.file = try tmp.dir.createFile(std.Options.debug_io, "logger.log", .{});
+    }
+
+    logger.deinit();
+    try std.testing.expect(logger.file == null);
+    try std.testing.expectEqualStrings("", logger.path);
+    logger.deinit();
+}
+
+test "LogSystem deinit accepts an unused logger" {
+    var logger = LogSystem{};
+    logger.deinit();
+    logger.deinit();
+    try std.testing.expect(logger.file == null);
+    try std.testing.expectEqualStrings("", logger.path);
+}
