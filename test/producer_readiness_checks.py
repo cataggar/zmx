@@ -51,7 +51,8 @@ def no_output_deadline():
     waits = []
 
     def read(remaining):
-        assert not waits, "read again after the absolute deadline"
+        if waits:
+            raise RuntimeError("read again after the absolute deadline")
         waits.append(remaining)
         clock.value += remaining
         return None
@@ -70,7 +71,8 @@ def progress_keeps_deadline():
         waits = []
 
         def read(remaining):
-            assert len(waits) < 8, "read beyond the fixed deadline"
+            if len(waits) >= 8:
+                raise RuntimeError("read beyond the fixed deadline")
             waits.append(remaining)
             clock.value += 1
             chunk = b"complete" if marker_at_expiry and clock.value == 8 else b"x"
