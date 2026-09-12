@@ -244,6 +244,48 @@ def ascii_newline_size():
     assert all(decoded[name] == value for name, value in metrics.items())
 
 
+def failure_output_boundary():
+    sentinel = b"INITIALIZATION_DETAIL_MUST_NOT_ESCAPE"
+    initialization_error = (
+        b"Traceback (most recent call last):\n"
+        b"  File \"fixture.py\", line 27, in <module>\n"
+        b"    Path(home).mkdir()\n"
+        b"FileExistsError: [Errno 17] " + sentinel + b"\n"
+    )
+    valid = encode(unknown_metrics())
+    assert diagnostic.filter_failure_output(valid) == valid
+    invalid_metrics = unknown_metrics()
+    invalid_metrics["read_checks"] = False
+    flagged = encode(invalid_metrics)
+    assert json.loads(flagged)["invalid_metrics"] is True
+    assert diagnostic.filter_failure_output(flagged) == flagged
+
+    malformed = [
+        initialization_error, initialization_error + valid, valid + initialization_error,
+        b"", b"\xff", b"null\n", b"[]\n", b"{}\n", b"{" * 2048,
+        b"[" * 1024 + b"]" * 1024, valid + b"\x00",
+        valid[:-1], valid + b"\n", valid + valid,
+        b" " * (diagnostic.MAX_RECORD_BYTES + 1),
+        valid + b"\n" * diagnostic.MAX_RECORD_BYTES,
+        valid.replace(b'"schema":', b'"schema":"duplicate","schema":', 1),
+    ]
+    for name, value in (
+        ("schema", "unknown"), ("client_status_source", "unknown"),
+        ("terminal_role", "unknown"), ("phase", sentinel.decode("ascii")),
+        ("read_checks", True), ("received_bytes", -1),
+        ("invalid_metrics", 1), ("payload", sentinel.decode("ascii")),
+    ):
+        changed = json.loads(valid)
+        changed[name] = value
+        malformed.append((json.dumps(changed, separators=(",", ":")) + "\n").encode("ascii"))
+    for captured in malformed:
+        filtered = diagnostic.filter_failure_output(captured)
+        assert filtered == b"producer diagnostics=unavailable\n"
+        assert sentinel not in filtered and b"Traceback" not in filtered
+        assert b"FileExistsError" not in filtered and b"fixture.py" not in filtered
+        assert len(filtered) <= diagnostic.MAX_RECORD_BYTES
+
+
 CASES = {
     "unobserved-versus-empty": unobserved_versus_empty,
     "short-read-metrics": short_read_metrics,
@@ -253,6 +295,7 @@ CASES = {
     "enum-and-field-rejection": enum_and_field_rejection,
     "payload-non-disclosure": payload_non_disclosure,
     "ascii-newline-size": ascii_newline_size,
+    "failure-output-boundary": failure_output_boundary,
 }
 
 if __name__ == "__main__":

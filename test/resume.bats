@@ -2,6 +2,32 @@
 
 load test_helper
 
+# Sanitize before run captures output: its verbose/failure modes can print it.
+producer_fixture() {
+  local -a results
+  python3 -B "$BATS_TEST_DIRNAME/resume_pty.py" "$ZMX" producer_drain 2>&1 | {
+    local checked filter_status discarded
+    if checked="$(python3 -I -S -B "$BATS_TEST_DIRNAME/producer_diagnostics.py" 2>/dev/null)"; then
+      printf '%s\n' "$checked"
+      filter_status=$?
+    else
+      filter_status=$?
+    fi
+    # Keep the pipe open even if validation fails, without retaining/printing
+    # rejected bytes or causing the fixture to fail early on a broken pipe.
+    while IFS= read -r -n 4096 discarded; do :; done
+    exit "$filter_status"
+  }
+  results=("${PIPESTATUS[@]}")
+  if [[ "${results[0]}" -ne 0 ]]; then
+    printf 'producer fixture status=%s\n' "${results[0]}"
+    if [[ "${results[1]}" -ne 0 ]]; then
+      printf 'producer diagnostics=unavailable\n'
+    fi
+  fi
+  return "${results[0]}"
+} 2>/dev/null
+
 @test "capabilities: exact response without configuration, logs, sockets, or stdin" {
   local untouched="$BATS_TEST_TMPDIR/untouched"
   run env ZMX_DIR="$untouched" HOME="$untouched" XDG_STATE_HOME="$untouched" \
@@ -109,9 +135,9 @@ PY
 }
 
 @test "resume: producer EOF drains healthy client and expires stalled snapshot after five seconds" {
-  run python3 -B "$BATS_TEST_DIRNAME/resume_pty.py" "$ZMX" producer_drain
+  run producer_fixture
   [ "$status" -eq 0 ] || {
-    printf 'producer fixture status=%s\n%s\n' "$status" "$output"
+    printf '%s\n' "$output"
     return 1
   }
 }

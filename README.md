@@ -83,11 +83,19 @@ empty value, fails setup without building or falling back. When unset, the
 existing `zig-out/bin/zmx` selection and automatic build behavior are unchanged.
 No binary is copied, linked, modified, or rebuilt for an override.
 
-`bats test/producer_diagnostics.bats` runs eight finite, memory-only encoder and
-metrics checks using Python's standard library. These cases do not load the
-session helper, import the runtime fixture, or start zmx/PTY/socket sessions.
+`bats test/producer_diagnostics.bats` runs nine finite, memory-only encoder,
+metrics, and failure-output checks using Python's standard library. These cases
+do not load the session helper, import the runtime fixture, or start
+zmx/PTY/socket sessions.
 The Python driver is `test/producer_diagnostics_checks.py`; each named case can
 also be selected directly with `python3 -B` and its case name.
+
+The producer fixture's Bats wrapper publishes only its failure status and one
+complete, bounded canonical diagnostic record. It reuses the record encoder
+to validate captured output before Bats receives it. Initialization errors,
+malformed/oversized output, or validator failure produce an explicit
+`producer diagnostics=unavailable` message, never a captured traceback.
+The original fixture failure remains nonzero.
 
 Select unit tests with repeatable, nonempty filters, for example
 `zig build test -Dtest-filter=attachment: -Dtest-filter=drain: -Dtest-filter=serializeTerminalState`.

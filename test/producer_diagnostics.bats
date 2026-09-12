@@ -40,3 +40,7 @@ check_diagnostic_case() {
 @test "producer diagnostics: ascii-newline-size" {
   check_diagnostic_case ascii-newline-size
 }
+
+@test "producer diagnostics: failure-output-boundary" {
+  check_diagnostic_case failure-output-boundary
+}

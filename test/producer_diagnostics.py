@@ -10,6 +10,7 @@ import json
 
 MAX_RECORD_BYTES = 4096
 MAX_METRIC = (1 << 63) - 1
+UNAVAILABLE_OUTPUT = b"producer diagnostics=unavailable\n"
 PHASES = (
     "setup", "fifo_create", "producer_source", "fifo_open", "environment",
     "starter_create", "starter_ready", "starter_detach", "starter_cleanup",
@@ -74,7 +75,7 @@ def error_kind(error):
     return "other"
 
 
-def encode_failure(phase, point, error, role, site, metrics):
+def encode_failure(phase, point, error, role, site, metrics, *, invalid_metrics=False):
     """Never accept payload, exception text, arbitrary keys, or arbitrary strings."""
     if any(type(value) is not str for value in (phase, point, error, site)) or (role is not None and type(role) is not str):
         raise ValueError("invalid producer diagnostic enum type")
@@ -82,6 +83,8 @@ def encode_failure(phase, point, error, role, site, metrics):
         raise ValueError("invalid producer diagnostic enum")
     if set(metrics) != set(NUMBERS + FLAGS):
         raise ValueError("invalid producer diagnostic fields")
+    if type(invalid_metrics) is not bool:
+        raise ValueError("invalid producer diagnostic flag")
     record = {
         "schema": "zmx-producer-failure-v1",
         "phase": phase,
@@ -92,7 +95,8 @@ def encode_failure(phase, point, error, role, site, metrics):
         # Null returncode means no cached exit observation, NOT "running".
         "client_status_source": None if role is None else "popen_returncode_cache",
     }
-    invalid = False
+    # Revalidation preserves a flag set before invalid observations became null.
+    invalid = invalid_metrics
     for name in NUMBERS:
         value = metrics[name]
         minimum = -MAX_METRIC if name == "client_returncode_cached" else 0
@@ -113,3 +117,36 @@ def encode_failure(phase, point, error, role, site, metrics):
     if len(encoded) > MAX_RECORD_BYTES:
         raise ValueError("producer diagnostic exceeds size limit")
     return encoded
+
+
+def filter_failure_output(captured):
+    """Re-encode one complete canonical record; never forward captured text."""
+    if type(captured) is not bytes or len(captured) > MAX_RECORD_BYTES:
+        return UNAVAILABLE_OUTPUT
+    try:
+        record = json.loads(captured)
+        if type(record) is not dict:
+            return UNAVAILABLE_OUTPUT
+        encoded = encode_failure(
+            record["phase"], record["observation"], record["error"],
+            record["terminal_role"], record["failure_site"],
+            {name: record[name] for name in NUMBERS + FLAGS},
+            invalid_metrics=record["invalid_metrics"],
+        )
+    except (ValueError, KeyError, TypeError, RecursionError):
+        return UNAVAILABLE_OUTPUT
+    # Exact equality also rejects extra/duplicate keys, altered metadata,
+    # noncanonical values, and incomplete or multiple records.
+    return encoded if encoded == captured else UNAVAILABLE_OUTPUT
+
+
+if __name__ == "__main__":
+    import sys
+
+    if len(sys.argv) != 1:
+        raise SystemExit(2)
+    filtered = filter_failure_output(sys.stdin.buffer.read(MAX_RECORD_BYTES + 1))
+    if filtered == UNAVAILABLE_OUTPUT:
+        raise SystemExit(1)
+    sys.stdout.buffer.write(filtered)
+    sys.stdout.buffer.flush()
