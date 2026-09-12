@@ -714,7 +714,7 @@ test "attachment: producer truncation leaves receiver unavailable with unsent da
     try testing.expect(try capture.prepare(&source, &stream, true, false));
     try capture.info();
     // Unlike drain(), only this prefix reaches the receiver before EOF.
-    // The daemon's current one-write EOF policy can leave the rest unsent.
+    // An expired producer drain can leave the rest unsent.
     try capture.transfer(4096, 4096, true);
     try testing.expect(capture.wire.items.len > 0);
     try testing.expect(capture.receiver.boundary_received);

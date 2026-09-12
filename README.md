@@ -78,8 +78,9 @@ If the test directory exceeds the OS Unix-socket path limit, set
 path; each test creates its own socket directory beneath it.
 
 Select unit tests with repeatable, nonempty filters, for example
-`zig build test -Dtest-filter=attachment: -Dtest-filter=serializeTerminalState`.
-The attachment tests use in-memory IPC queues and Ghostty terminals, not
+`zig build test -Dtest-filter=attachment: -Dtest-filter=drain: -Dtest-filter=serializeTerminalState`.
+The attachment and producer-drain tests use in-memory IPC queues, an injected
+clock/transport, and Ghostty terminals, not
 daemons, PTYs, sockets, signals, environment changes, or login shells.
 
 ## usage
@@ -183,12 +184,37 @@ limitation. The improved handoff therefore requires **both** an updated client
 and daemon; replacing the executable does not upgrade already-running daemons.
 The existing capability response and resume exit codes are unchanged.
 
-This handoff does not add reliable producer-side delivery after PTY EOF.
-The daemon still exits after that poll iteration, which can leave queued data
-unsent to a backpressured client. Client-side draining preserves complete
-frames already delivered, not bytes still queued in the daemon. EOF before
-the Info reply remains an unsuccessful attachment. A bounded daemon drain
-policy is separate work; no new timeout or shutdown budget is introduced.
+### final output after producer EOF
+
+At the first PTY EOF observation the daemon starts a **fixed five-second
+awake-time drain window**. One immutable deadline applies to all remaining
+client queues; progress, repeated EOF, and interrupted waits do not renew it.
+The dead PTY and listener are no longer polled, and no new Init, Info, or
+application work is processed. The window applies only after producer EOF,
+not to live sessions. Linux's closed-slave EIO is also treated as PTY EOF.
+
+Each client drains independently and is closed promptly when its queue is
+empty. Partial writes and EAGAIN preserve the remaining bytes. At expiry,
+stalled clients are disconnected and their unsent bytes discarded. Peer
+failure or explicit cancellation can end delivery earlier. On an existing
+draining connection, detach cancels that client and kill/detach-all cancels
+the drain; daemon SIGTERM also cancels the drain. New connections are not
+accepted during draining.
+Unexpected polling failures are reported as errors, not successful delivery.
+No new buffer cap is imposed.
+
+The deadline uses a monotonic awake clock, unaffected by wall-clock changes
+and paused during system suspension; scheduling can delay expiry processing.
+The forkpty child remains unreaped through draining and the existing final
+group signals, preventing PID/process-group reuse during the window. Reaping
+happens once after the last signal.
+
+An empty sender queue means bytes were handed to the socket, **not**
+acknowledged or displayed by the receiving terminal. Client-side draining
+preserves complete frames already delivered. A truncated snapshot without
+Info still does not confirm attachment, and non-creating resume remains
+unsuccessful in that case. The existing client cleanup, capability response,
+and exit codes are unchanged.
 
 ### client cleanup and scrollback
 

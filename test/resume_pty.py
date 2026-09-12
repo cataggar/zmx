@@ -249,18 +249,19 @@ def absent():
     ordinary.unlink()
 
 
-def read_message(connection):
-    def read_exact(size):
-        data = b""
-        while len(data) < size:
-            part = connection.recv(size - len(data))
-            assert part, "client closed a probe socket instead of retaining it"
-            data += part
-        return data
+def read_exact(connection, size):
+    data = b""
+    while len(data) < size:
+        part = connection.recv(size - len(data))
+        assert part, "peer closed before completing the frame"
+        data += part
+    return data
 
-    header = read_exact(8)
+
+def read_message(connection):
+    header = read_exact(connection, 8)
     length = int.from_bytes(header[1:5], sys.byteorder)
-    return header[0], read_exact(length)
+    return header[0], read_exact(connection, length)
 
 
 def read_init(connection):
@@ -346,6 +347,85 @@ def closing_restore():
                     assert not error, error
         assert_no_spawn(name)
         path.unlink()
+
+
+def producer_drain():
+    # Only fixture-owned files and an explicit isolated Python producer are
+    # used; the FIFO controls producer completion without terminal input.
+    control_path = ROOT / "producer-control"
+    producer_path = ROOT / "producer.py"
+    os.mkfifo(control_path, 0o600)
+    producer_path.write_text(
+        "import os, sys\n"
+        "with open(sys.argv[1], 'rb', buffering=0) as control:\n"
+        "    print('PRODUCER_READY', flush=True)\n"
+        "    assert control.read(1) == b'd'\n"
+        "    for row in range(12000):\n"
+        "        print(f'ROW_{row:05d}_' + 'x' * 60)\n"
+        "    print('PRODUCER_COMPLETE', flush=True)\n"
+        "    assert control.read(1) == b'x'\n"
+    )
+    control = os.open(control_path, os.O_RDWR | os.O_NONBLOCK)
+    trap_env = install_spawn_trap()
+    env = {key: trap_env[key] for key in ("HOME", "SHELL", "TERM", "PS1", "ZMX_SESSION", "ZMX_DIR")}
+    env.update(PATH="/usr/bin:/bin", INPUTRC="/dev/null")
+    name = "producer-drain"
+    try:
+        with terminal("attach", name, sys.executable, "-I", str(producer_path), str(control_path), env=env) as starter:
+            starter.expect(b"PRODUCER_READY")
+            starter.detach()
+        with terminal("resume", name, env=env) as healthy:
+            healthy.expect(b"PRODUCER_READY")
+            os.write(control, b"d")
+            healthy.expect(b"PRODUCER_COMPLETE")
+            assert healthy.output.count(b"ROW_") == 12000
+            with socket.socket(socket.AF_UNIX) as stalled:
+                stalled.settimeout(TIMEOUT)
+                send_buffer = stalled.getsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF)
+                stalled.connect(str(ROOT / name))
+
+                def frame(tag, payload):
+                    return bytes([tag]) + len(payload).to_bytes(4, sys.byteorder) + b"\0" * 3 + payload
+
+                stalled.sendall(
+                    frame(14, b"") + frame(7, struct.pack("=HHHH", 24, 80, 0, 0)) + frame(6, b"")
+                )
+                assert read_message(stalled) == (14, b"")
+                header = read_exact(stalled, 8)
+                assert header[0] == 1, header
+                snapshot_bytes = int.from_bytes(header[1:5], sys.byteorder)
+                # Both sockets use the kernel's default send buffer. Reject a
+                # host unsuitable for this fixture instead of silently passing
+                # without pressure; the expiry log additionally proves unsent
+                # producer data, rather than assuming pressure from size alone.
+                assert snapshot_bytes > 2 * send_buffer, (snapshot_bytes, send_buffer)
+                ended = time.monotonic()
+                deadline = ended + TIMEOUT
+                os.write(control, b"x")
+                healthy.finished(0)
+                assert time.monotonic() - ended < 5, "healthy client waited for the stalled peer"
+                log_path = ROOT / "logs" / f"{name}.log"
+                eventually(lambda: "reason=deadline" in log_path.read_text())
+                assert time.monotonic() - ended >= 5, "stalled client expired early"
+                received = b""
+                while True:
+                    remaining = deadline - time.monotonic()
+                    assert remaining > 0, "producer drain exceeded fixture budget"
+                    stalled.settimeout(remaining)
+                    chunk = stalled.recv(65536)
+                    if not chunk:
+                        break
+                    received += chunk
+                assert len(received) < snapshot_bytes, "fixture did not retain a backpressured snapshot"
+                # Info follows the whole snapshot, so this truncated frame
+                # cannot constitute attachment readiness.
+                expiry = [line for line in log_path.read_text().splitlines() if "reason=deadline" in line]
+                assert len(expiry) == 1 and "unsent=0" not in expiry[0], expiry
+                assert not (ROOT / "spawned").exists()
+    finally:
+        os.close(control)
+        control_path.unlink()
+        producer_path.unlink()
 
 
 def switching():
