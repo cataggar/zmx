@@ -62,7 +62,8 @@ brew install neurosnap/tap/zmx
 
 The Zig 0.17 source port preserves the targeted first-attach/final-output and
 scrollback fixes through `8305836f0712bc704ee69fd9b46333a773372a73`. Platform
-C bindings use the exact pinned `cataggar/translate-c` and GitHub Aro mirror.
+C bindings use the exact pinned `cataggar/translate-c` and GitHub Aro mirror,
+including each cross-platform release module.
 The source port is not ready for consumption until its Ghostty dependency is
 replaced with the separately validated Zig 0.17 pin; the retained 0.16 pin
 currently blocks build configuration.
@@ -87,7 +88,8 @@ session/PTY integration suite locally with:
 
 ```sh
 zig build -Doptimize=safe --prefix zig-out/integration
-ZMX_TEST_BIN="$(pwd)/zig-out/integration/bin/zmx" bats test
+env -u ZMX_SESSION -u ZMX_SESSION_PREFIX \
+    ZMX_TEST_BIN="$(pwd)/zig-out/integration/bin/zmx" bats test
 ```
 
 The separate prefix preserves the Debug `zig-out/bin/zmx`. These tests

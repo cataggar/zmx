@@ -151,6 +151,7 @@ pub fn build(b: *std.Build) void {
                 .link_libc = true,
             });
             release_mod.addOptions("build_options", options);
+            release_mod.addImport("zmx-c", platformC(b, resolved, .safe));
 
             if (b.lazyDependency("ghostty", .{
                 .target = resolved,
