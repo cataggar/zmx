@@ -86,7 +86,7 @@ With Bats, Python 3, Bash, and `timeout` installed, run the same real
 session/PTY integration suite locally with:
 
 ```sh
-zig build -Doptimize=ReleaseSafe --prefix zig-out/integration
+zig build -Doptimize=safe --prefix zig-out/integration
 ZMX_TEST_BIN="$(pwd)/zig-out/integration/bin/zmx" bats test
 ```
 

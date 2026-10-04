@@ -1590,8 +1590,8 @@ test "attachment: setup failures reject only the attaching client" {
     var saw_continuation_failure = false;
     var saw_unavailable = false;
     var saw_success = false;
-    for (0..3) |cut| {
-        for (0..if (cut == 2) @as(usize, 1) else 8) |fail_index| {
+    for (0..4) |cut| {
+        for (0..if (cut >= 2) @as(usize, 1) else 8) |fail_index| {
             var source = try ghostty_vt.Terminal.init(std.Options.debug_io, testing.allocator, .{
                 .cols = 80,
                 .rows = 24,
@@ -1643,7 +1643,9 @@ test "attachment: setup failures reject only the attaching client" {
             // A later Info is in the same batch. The dispatcher must reject the
             // client and return false before the caller can handle or flush it.
             try ipc.appendMessage(testing.allocator, &attaching.read_buf.buf, .Info, "");
-            var failing = testing.FailingAllocator.init(testing.allocator, .{ .fail_index = fail_index });
+            var failing = testing.FailingAllocator.init(testing.allocator, .{
+                .fail_index = if (cut == 3) std.math.maxInt(usize) else fail_index,
+            });
             daemon.alloc = failing.allocator();
             var observed: Observed = .{};
             const memory_io: MemoryIo = .{
@@ -1653,6 +1655,12 @@ test "attachment: setup failures reject only the attaching client" {
             const initialized = daemon.dispatchInit(attaching, &source, &stream, std.mem.asBytes(&size), memory_io);
             var accepted = initialized;
             if (initialized) {
+                if (cut == 3) {
+                    // Require Info to grow the queue regardless of ArrayList growth policy.
+                    attaching.write_buf.shrinkAndFree(testing.allocator, attaching.write_buf.items.len);
+                    failing.fail_index = failing.alloc_index;
+                    failing.resize_fail_index = failing.resize_index;
+                }
                 const next = attaching.read_buf.next().?;
                 try testing.expectEqual(ipc.Tag.Info, next.header.tag);
                 accepted = daemon.dispatchInfo(attaching, memory_io);

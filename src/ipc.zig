@@ -28,7 +28,7 @@ pub const Tag = enum(u8) {
 };
 
 comptime {
-    if (@typeInfo(Tag).@"enum".is_exhaustive) @compileError(
+    if (@typeInfo(Tag).@"enum".mode == .exhaustive) @compileError(
         "ipc.Tag must stay non-exhaustive — old daemons rely on `_` to ignore unknown tags",
     );
 }

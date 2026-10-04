@@ -120,15 +120,16 @@ pub const LogSystem = struct {
 };
 
 test "LogSystem deinit releases ownership and can repeat" {
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
+    const cwd = std.Io.Dir.cwd();
+    const path = "zmx-log-deinit-test.log";
 
     var logger = LogSystem{ .alloc = std.testing.allocator };
     {
-        logger.path = try std.testing.allocator.dupe(u8, "logger.log");
+        logger.path = try std.testing.allocator.dupe(u8, path);
         errdefer std.testing.allocator.free(logger.path);
-        logger.file = try tmp.dir.createFile(std.Options.debug_io, "logger.log", .{});
+        logger.file = try cwd.createFile(std.testing.io, path, .{ .exclusive = true });
     }
+    defer cwd.deleteFile(std.testing.io, path) catch unreachable;
 
     logger.deinit();
     try std.testing.expect(logger.file == null);
