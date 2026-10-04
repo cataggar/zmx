@@ -56,14 +56,25 @@ brew install neurosnap/tap/zmx
 
 ### src
 
-- Requires zig `v0.15`
+- Requires Zig `0.17.0` from the pinned `cataggar/zig` release.
 - Clone the repo
 - Run build cmd
+
+The Zig 0.17 source port preserves the targeted first-attach/final-output and
+scrollback fixes through `8305836f0712bc704ee69fd9b46333a773372a73`. Platform
+C bindings use the exact pinned `cataggar/translate-c` and GitHub Aro mirror,
+including each cross-platform release module.
+Ghostty's merged Zig 0.17 source prerequisite is pinned at
+`90ca4b813aa2742db56a59d7e3d25d2e6ed5d297`, including the immutable-package
+metadata fix. Normal builds use the regular cache path, not checkout overrides,
+fake Git metadata or cache poisoning. Native macOS runtime qualification is
+tracked separately in
+[cataggar/droid#377](https://github.com/cataggar/droid/issues/377).
 
 Be sure to add `~/.local/bin` to your `PATH`:
 
 ```bash
-zig build -Doptimize=ReleaseSafe --prefix ~/.local
+zig build -Doptimize=safe --prefix ~/.local
 ```
 
 ### tests
@@ -79,8 +90,9 @@ With Bats, Python 3, Bash, and `timeout` installed, run the same real
 session/PTY integration suite locally with:
 
 ```sh
-zig build -Doptimize=ReleaseSafe --prefix zig-out/integration
-ZMX_TEST_BIN="$(pwd)/zig-out/integration/bin/zmx" bats test
+zig build -Doptimize=safe --prefix zig-out/integration
+env -u ZMX_SESSION -u ZMX_SESSION_PREFIX \
+    ZMX_TEST_BIN="$(pwd)/zig-out/integration/bin/zmx" bats test
 ```
 
 The separate prefix preserves the Debug `zig-out/bin/zmx`. These tests

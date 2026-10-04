@@ -863,7 +863,7 @@ const Daemon = struct {
         if (self.command) |cmd_args| {
             const argv = try alloc.allocSentinel(?[*:0]const u8, cmd_args.len, null);
             for (cmd_args, 0..) |arg, i| {
-                argv[i] = try alloc.dupeZ(u8, arg);
+                argv[i] = try alloc.dupeSentinel(u8, arg, 0);
             }
             const err = compat.execvpeZ(alloc, argv[0].?, argv.ptr, std.c.environ);
             std.log.err("execvpe failed: cmd={s} err={s}", .{ cmd_args[0], @errorName(err) });
@@ -1350,7 +1350,7 @@ const Daemon = struct {
                                 self.closeFinalOutput(io, .cancelled);
                                 return;
                             },
-                            else => std.log.debug("ignoring IPC after producer EOF tag={d}", .{@intFromEnum(msg.header.tag)}),
+                            else => std.log.debug("ignoring IPC after producer EOF tag={d}", .{@backingInt(msg.header.tag)}),
                         }
                     }
                 }
@@ -1590,8 +1590,8 @@ test "attachment: setup failures reject only the attaching client" {
     var saw_continuation_failure = false;
     var saw_unavailable = false;
     var saw_success = false;
-    for (0..3) |cut| {
-        for (0..if (cut == 2) @as(usize, 1) else 8) |fail_index| {
+    for (0..4) |cut| {
+        for (0..if (cut >= 2) @as(usize, 1) else 8) |fail_index| {
             var source = try ghostty_vt.Terminal.init(std.Options.debug_io, testing.allocator, .{
                 .cols = 80,
                 .rows = 24,
@@ -1643,7 +1643,9 @@ test "attachment: setup failures reject only the attaching client" {
             // A later Info is in the same batch. The dispatcher must reject the
             // client and return false before the caller can handle or flush it.
             try ipc.appendMessage(testing.allocator, &attaching.read_buf.buf, .Info, "");
-            var failing = testing.FailingAllocator.init(testing.allocator, .{ .fail_index = fail_index });
+            var failing = testing.FailingAllocator.init(testing.allocator, .{
+                .fail_index = if (cut == 3) std.math.maxInt(usize) else fail_index,
+            });
             daemon.alloc = failing.allocator();
             var observed: Observed = .{};
             const memory_io: MemoryIo = .{
@@ -1653,6 +1655,12 @@ test "attachment: setup failures reject only the attaching client" {
             const initialized = daemon.dispatchInit(attaching, &source, &stream, std.mem.asBytes(&size), memory_io);
             var accepted = initialized;
             if (initialized) {
+                if (cut == 3) {
+                    // Require Info to grow the queue regardless of ArrayList growth policy.
+                    attaching.write_buf.shrinkAndFree(testing.allocator, attaching.write_buf.items.len);
+                    failing.fail_index = failing.alloc_index;
+                    failing.resize_fail_index = failing.resize_index;
+                }
                 const next = attaching.read_buf.next().?;
                 try testing.expectEqual(ipc.Tag.Info, next.header.tag);
                 accepted = daemon.dispatchInfo(attaching, memory_io);
@@ -1861,7 +1869,8 @@ test "drain: production loop handles partial writes and EAGAIN independently" {
     defer fixture.deinit();
     const first = try fixture.queue(0, "healthy", true);
     defer testing.allocator.free(first);
-    const second = try fixture.queue(1, "final output " ** 600, true);
+    const repeated_output = comptime @import("test_data.zig").repeat("final output ", 600);
+    const second = try fixture.queue(1, &repeated_output, true);
     defer testing.allocator.free(second);
     try fixture.run();
     try testing.expectEqualSlices(u8, first, fixture.peers[0].handed.items);
@@ -1954,7 +1963,8 @@ test "drain: truncated producer snapshot at expiry never supplies Info readiness
     defer term.deinit(testing.allocator);
     var stream = attachment.trackedStream(testing.allocator, &term, 1024);
     defer stream.deinit();
-    stream.nextSlice("retained output for final snapshot\r\n" ** 300);
+    const repeated_output = comptime @import("test_data.zig").repeat("retained output for final snapshot\r\n", 300);
+    stream.nextSlice(&repeated_output);
     const client = fixture.daemon.clients.items[0];
     client.admission.begin();
     try testing.expect(try client.admission.prepareInit(
@@ -2072,7 +2082,7 @@ fn printVersion(cfg: *Cfg) !void {
     var buf: [256]u8 = undefined;
     var w = std.Io.File.stdout().writerStreaming(std.Options.debug_io, &buf);
     var ver = version;
-    if (builtin.mode == .Debug) {
+    if (builtin.mode == .debug) {
         ver = git_sha;
     }
     try w.interface.print(
@@ -2757,7 +2767,7 @@ fn fetchHistory(
     };
     defer compat.close(fd);
 
-    const format_byte: u8 = @intFromEnum(util.HistoryFormat.plain);
+    const format_byte: u8 = @backingInt(util.HistoryFormat.plain);
     const payload = [_]u8{format_byte};
     ipc.send(fd, .History, &payload) catch |err| switch (err) {
         error.BrokenPipe, error.ConnectionResetByPeer => return error.SessionUnresponsive,
@@ -2820,7 +2830,7 @@ fn history(cfg: *Cfg, session_name: []const u8, format: util.HistoryFormat) !voi
     };
     defer compat.close(fd);
 
-    const format_byte = [_]u8{@intFromEnum(format)};
+    const format_byte = [_]u8{@backingInt(format)};
     ipc.send(fd, .History, &format_byte) catch |err| switch (err) {
         error.BrokenPipe, error.ConnectionResetByPeer => return,
         else => return err,
@@ -3743,7 +3753,7 @@ fn daemonLoop(daemon: *Daemon, server_sock_fd: i32, pty_fd: i32) !void {
                         .Write => try daemon.handleWrite(client, msg.payload),
                         _ => std.log.warn(
                             "ignoring unknown IPC tag={d}",
-                            .{@intFromEnum(msg.header.tag)},
+                            .{@backingInt(msg.header.tag)},
                         ),
                     }
                 }

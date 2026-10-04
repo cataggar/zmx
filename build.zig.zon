@@ -2,11 +2,15 @@
     .name = .zmx,
     .version = "0.6.0",
     .fingerprint = 0x28aad87005052b4e, // Changing this has security and trust implications.
-    .minimum_zig_version = "0.16.0",
+    .minimum_zig_version = "0.17.0",
     .dependencies = .{
+        .translate_c = .{
+            .url = "git+https://github.com/cataggar/translate-c#62d06a5d3e93c82727544e8113e4762a315ca0ed",
+            .hash = "translate_c-2.0.0-Q_BUWlpOBwBWvgGBM20tJq-GXgPio3v3UD39rXEn70KN",
+        },
         .ghostty = .{
-            .url = "git+https://github.com/cataggar/ghostty.git#84d51b6dc6f8d8d1f338aa7c1d8eafa59dde78fa",
-            .hash = "ghostty-1.3.2-dev-5UdBCxA4RwV_OrZV2dGPzvS4GfRfr4zWVm8A5lZpMojX",
+            .url = "git+https://github.com/cataggar/ghostty#90ca4b813aa2742db56a59d7e3d25d2e6ed5d297",
+            .hash = "ghostty-1.3.2-dev-5UdBC0GfSQVgt363wts-5r7cQWrzQZel39g3kEY-HWf1",
         },
     },
     .paths = .{

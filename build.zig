@@ -1,5 +1,20 @@
 const std = @import("std");
 
+fn platformC(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.lang.Optimize) *std.Build.Module {
+    const header = switch (target.result.os.tag) {
+        .macos => "#include <sys/ioctl.h>\n#include <termios.h>\n#include <stdlib.h>\n#include <unistd.h>\n",
+        .freebsd => "#include <termios.h>\n#include <libutil.h>\n#include <stdlib.h>\n#include <unistd.h>\n",
+        else => "#include <sys/ioctl.h>\n#include <pty.h>\n#include <stdlib.h>\n#include <unistd.h>\n",
+    };
+    const translator: @import("translate_c").Translator = .init(b.dependency("translate_c", .{}), .{
+        .name = "zmx-c",
+        .c_source_file = b.addWriteFiles().add("zmx-c.h", header),
+        .target = target,
+        .optimize = optimize,
+    });
+    return translator.mod;
+}
+
 const linux_targets: []const std.Target.Query = &.{
     .{ .cpu_arch = .x86_64, .os_tag = .linux, .abi = .musl },
     .{ .cpu_arch = .aarch64, .os_tag = .linux, .abi = .musl },
@@ -41,6 +56,8 @@ pub fn build(b: *std.Build) void {
         .link_libc = true,
     });
     exe_mod.addOptions("build_options", options);
+    const platform_c = platformC(b, target, optimize);
+    exe_mod.addImport("zmx-c", platform_c);
 
     const dep = b.dependency("ghostty", .{
         .target = target,
@@ -68,7 +85,7 @@ pub fn build(b: *std.Build) void {
         b.installArtifact(exe);
         const run_cmd = b.addRunArtifact(exe);
         run_cmd.step.dependOn(b.getInstallStep());
-        if (b.args) |args| run_cmd.addArgs(args);
+        run_cmd.addPassthruArgs();
         run_step.dependOn(&run_cmd.step);
     }
 
@@ -91,6 +108,7 @@ pub fn build(b: *std.Build) void {
             "ghostty-vt",
             test_dep.module("ghostty-vt"),
         );
+        test_module.addImport("zmx-c", platform_c);
         const exe_unit_tests = b.addTest(.{
             .root_module = test_module,
             .filters = test_filters,
@@ -129,14 +147,15 @@ pub fn build(b: *std.Build) void {
             const release_mod = b.createModule(.{
                 .root_source_file = b.path("src/main.zig"),
                 .target = resolved,
-                .optimize = .ReleaseSafe,
+                .optimize = .safe,
                 .link_libc = true,
             });
             release_mod.addOptions("build_options", options);
+            release_mod.addImport("zmx-c", platformC(b, resolved, .safe));
 
             if (b.lazyDependency("ghostty", .{
                 .target = resolved,
-                .optimize = .ReleaseSafe,
+                .optimize = .safe,
                 .@"emit-lib-vt" = true,
                 .@"emit-xcframework" = false,
             })) |release_dep| {
