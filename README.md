@@ -65,12 +65,10 @@ scrollback fixes through `8305836f0712bc704ee69fd9b46333a773372a73`. Platform
 C bindings use the exact pinned `cataggar/translate-c` and GitHub Aro mirror,
 including each cross-platform release module.
 Ghostty's merged Zig 0.17 source prerequisite is pinned at
-`d3ce82b38b40c264faca019acf642966dc55b37d`. This source port remains unaccepted
-for consumption: default fetched-package configuration fails with
-`FileSystemFailure` while hashing a missing Ghostty `.git` metadata dependency.
-Diagnostic compilation, output regressions and all four release targets pass
-with cache poisoning, but that is not a normal-build workaround or acceptance.
-The default-configuration gate is tracked in
+`90ca4b813aa2742db56a59d7e3d25d2e6ed5d297`, including the immutable-package
+metadata fix. Normal builds use the regular cache path, not checkout overrides,
+fake Git metadata or cache poisoning. Native macOS runtime qualification is
+tracked separately in
 [cataggar/droid#377](https://github.com/cataggar/droid/issues/377).
 
 Be sure to add `~/.local/bin` to your `PATH`:
