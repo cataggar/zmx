@@ -9,8 +9,8 @@
             .hash = "translate_c-2.0.0-Q_BUWlpOBwBWvgGBM20tJq-GXgPio3v3UD39rXEn70KN",
         },
         .ghostty = .{
-            .url = "git+https://github.com/cataggar/ghostty.git#84d51b6dc6f8d8d1f338aa7c1d8eafa59dde78fa",
-            .hash = "ghostty-1.3.2-dev-5UdBCxA4RwV_OrZV2dGPzvS4GfRfr4zWVm8A5lZpMojX",
+            .url = "git+https://github.com/cataggar/ghostty#d3ce82b38b40c264faca019acf642966dc55b37d",
+            .hash = "ghostty-1.3.2-dev-5UdBC6qTSQVuBZUkaKs-RIhmWnQ2p5N5QNLSVjAuEQTK",
         },
     },
     .paths = .{

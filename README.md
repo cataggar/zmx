@@ -64,9 +64,14 @@ The Zig 0.17 source port preserves the targeted first-attach/final-output and
 scrollback fixes through `8305836f0712bc704ee69fd9b46333a773372a73`. Platform
 C bindings use the exact pinned `cataggar/translate-c` and GitHub Aro mirror,
 including each cross-platform release module.
-The source port is not ready for consumption until its Ghostty dependency is
-replaced with the separately validated Zig 0.17 pin; the retained 0.16 pin
-currently blocks build configuration.
+Ghostty's merged Zig 0.17 source prerequisite is pinned at
+`d3ce82b38b40c264faca019acf642966dc55b37d`. This source port remains unaccepted
+for consumption: default fetched-package configuration fails with
+`FileSystemFailure` while hashing a missing Ghostty `.git` metadata dependency.
+Diagnostic compilation, output regressions and all four release targets pass
+with cache poisoning, but that is not a normal-build workaround or acceptance.
+The default-configuration gate is tracked in
+[cataggar/droid#377](https://github.com/cataggar/droid/issues/377).
 
 Be sure to add `~/.local/bin` to your `PATH`:
 
