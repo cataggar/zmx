@@ -56,14 +56,21 @@ brew install neurosnap/tap/zmx
 
 ### src
 
-- Requires zig `v0.15`
+- Requires Zig `0.17.0` from the pinned `cataggar/zig` release.
 - Clone the repo
 - Run build cmd
+
+The Zig 0.17 source port preserves the targeted first-attach/final-output and
+scrollback fixes through `8305836f0712bc704ee69fd9b46333a773372a73`. Platform
+C bindings use the exact pinned `cataggar/translate-c` and GitHub Aro mirror.
+The source port is not ready for consumption until its Ghostty dependency is
+replaced with the separately validated Zig 0.17 pin; the retained 0.16 pin
+currently blocks build configuration.
 
 Be sure to add `~/.local/bin` to your `PATH`:
 
 ```bash
-zig build -Doptimize=ReleaseSafe --prefix ~/.local
+zig build -Doptimize=safe --prefix ~/.local
 ```
 
 ### tests

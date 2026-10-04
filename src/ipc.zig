@@ -272,7 +272,7 @@ test "Tag wire values are frozen" {
         .{ Tag.Info, 6 },   .{ Tag.Init, 7 },          .{ Tag.History, 8 },
         .{ Tag.Run, 9 },    .{ Tag.Ack, 10 },          .{ Tag.Switch, 11 },
         .{ Tag.Write, 12 }, .{ Tag.TaskComplete, 13 }, .{ Tag.Attach, 14 },
-    }) |p| try std.testing.expectEqual(@as(u8, p[1]), @intFromEnum(p[0]));
+    }) |p| try std.testing.expectEqual(@as(u8, p[1]), @backingInt(p[0]));
 }
 
 test "zeroed Info has no stack garbage in wire bytes" {

@@ -382,17 +382,17 @@ test "attachment: receiver drains fully delivered legacy response with bounded w
     for ([_]bool{ false, true }) |acknowledged| {
         var capture = try Capture.init();
         defer capture.deinit();
-        const data = "restoration\r\n" ** 500;
-        try ipc.appendMessage(testing.allocator, &capture.wire, .Output, data);
+        const data = comptime @import("test_data.zig").repeat("restoration\r\n", 500);
+        try ipc.appendMessage(testing.allocator, &capture.wire, .Output, &data);
         if (acknowledged) try capture.info();
         try capture.drain(17, false);
         try testing.expectEqual(acknowledged, capture.receiver.ready);
         if (!acknowledged) {
             try testing.expectEqual(@as(usize, 0), capture.displayed.items.len);
-            try testing.expectEqualStrings(data, capture.output.items);
+            try testing.expectEqualStrings(&data, capture.output.items);
         }
         try capture.drain(11, true);
-        try testing.expectEqualStrings(data, capture.displayed.items);
+        try testing.expectEqualStrings(&data, capture.displayed.items);
         try testing.expectEqual(acknowledged, capture.receiver.ready);
     }
 }
