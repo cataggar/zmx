@@ -1099,18 +1099,33 @@ const Daemon = struct {
         };
     }
 
-    pub fn handleInput(self: *Daemon, client: *Client, payload: []const u8) !void {
-        std.log.debug("buffering pty input data={x}", .{payload});
+    pub fn handleInput(
+        self: *Daemon,
+        client: *Client,
+        term: *const ghostty_vt.Terminal,
+        payload: []const u8,
+    ) !void {
+        var filtered: ?[]const u8 = null;
+        defer if (filtered) |buf| self.alloc.free(buf);
+
+        const input = if (!util.isMouseTrackingEnabled(&term.modes)) blk: {
+            const stripped = try util.stripMouseInput(self.alloc, payload);
+            filtered = stripped;
+            if (stripped.len == 0) return;
+            break :blk stripped;
+        } else payload;
+
+        std.log.debug("buffering pty input data={x}", .{input});
         // client is leader, send entire payload (ansi escape codes + text)
         if (self.leader_client_fd == client.socket_fd) {
-            self.queuePtyInput(payload);
+            self.queuePtyInput(input);
             return;
         }
 
         // check if leader needs to be updated by detecting any user input
-        if (util.isUserInput(payload)) {
+        if (util.isUserInput(input)) {
             try self.setLeader(client);
-            self.queuePtyInput(payload);
+            self.queuePtyInput(input);
         }
     }
 
@@ -2076,6 +2091,76 @@ test "drain: child identity is retained through final signal and reaped once" {
     try std.testing.expect(child.pid == null);
     child.finish(&recorder);
     try std.testing.expectEqual(@as(usize, 4), recorder.count);
+}
+
+test "handleInput: forwards mouse input when enabled and drops late mouse reports after disable" {
+    const testing = std.testing;
+    var term = try ghostty_vt.Terminal.init(std.Options.debug_io, testing.allocator, .{
+        .cols = 80,
+        .rows = 24,
+    });
+    defer term.deinit(testing.allocator);
+    var stream = attachment.trackedStream(testing.allocator, &term, 1024);
+    defer stream.deinit();
+
+    var cfg: Cfg = .{ .socket_dir = "", .log_dir = "" };
+    var daemon: Daemon = .{
+        .cfg = &cfg,
+        .alloc = testing.allocator,
+        .clients = .empty,
+        .leader_client_fd = 101,
+        .session_name = "fixture",
+        .socket_path = "",
+        .running = true,
+        .pid = 0,
+        .created_at = 0,
+    };
+    defer {
+        for (daemon.clients.items) |client| {
+            client.deinitBuffers();
+            testing.allocator.destroy(client);
+        }
+        daemon.clients.deinit(testing.allocator);
+        daemon.pty_write_buf.deinit(testing.allocator);
+    }
+
+    for ([_]i32{ 101, 102 }) |fd| {
+        const client = try testing.allocator.create(Client);
+        client.* = .{
+            .alloc = testing.allocator,
+            .socket_fd = fd,
+            .read_buf = try ipc.SocketBuffer.init(testing.allocator),
+            .write_buf = .empty,
+        };
+        try daemon.clients.append(testing.allocator, client);
+    }
+    const leader = daemon.clients.items[0];
+    const follower = daemon.clients.items[1];
+
+    // While TUI enables mouse tracking (?1003h + ?1006h), leader mouse reports reach the PTY.
+    stream.nextSlice("\x1b[?1003h\x1b[?1006h");
+    try testing.expect(util.isMouseTrackingEnabled(&term.modes));
+    try daemon.handleInput(leader, &term, "\x1b[<35;72;44M");
+    try testing.expectEqualStrings("\x1b[<35;72;44M", daemon.pty_write_buf.items);
+    daemon.pty_write_buf.clearRetainingCapacity();
+
+    // After TUI exits and disables mouse tracking, in-flight mouse reports are dropped.
+    stream.nextSlice("\x1b[?1003l\x1b[?1006l");
+    try testing.expect(!util.isMouseTrackingEnabled(&term.modes));
+    try daemon.handleInput(leader, &term, "\x1b[<35;72;44M\x1b[<0;72;44m\x1b[M@!!");
+    try testing.expectEqual(@as(usize, 0), daemon.pty_write_buf.items.len);
+
+    // Accompanying keystrokes in the same payload are preserved without mouse garbage.
+    try daemon.handleInput(leader, &term, "\x1b[<35;72;44Mls -la\r");
+    try testing.expectEqualStrings("ls -la\r", daemon.pty_write_buf.items);
+    daemon.pty_write_buf.clearRetainingCapacity();
+
+    // Follower sending late mouse + keyboard input claims leader and queues only the keystroke.
+    try daemon.handleInput(follower, &term, "\x1b[<35;72;44M");
+    try testing.expectEqual(@as(?i32, 101), daemon.leader_client_fd);
+    try daemon.handleInput(follower, &term, "\x1b[<35;72;44Ma");
+    try testing.expectEqual(@as(?i32, 102), daemon.leader_client_fd);
+    try testing.expectEqualStrings("a", daemon.pty_write_buf.items);
 }
 
 fn printVersion(cfg: *Cfg) !void {
@@ -3720,7 +3805,7 @@ fn daemonLoop(daemon: *Daemon, server_sock_fd: i32, pty_fd: i32) !void {
                                 std.log.warn("ignoring invalid Attach payload length={d}", .{msg.payload.len});
                             }
                         },
-                        .Input => try daemon.handleInput(client, msg.payload),
+                        .Input => try daemon.handleInput(client, &term, msg.payload),
                         .Output => try daemon.handleOutput(msg.payload, &vt_stream),
                         .Init => {
                             if (!daemon.dispatchInit(client, &term, &vt_stream, msg.payload, ClientInitIo{

@@ -485,29 +485,83 @@ fn parseDecimal(buf: []const u8, pos: *usize) ?u32 {
     return value;
 }
 
+pub fn isMouseTrackingEnabled(modes: *const ghostty_vt.modes.ModeState) bool {
+    return modes.get(.mouse_event_x10) or
+        modes.get(.mouse_event_normal) or
+        modes.get(.mouse_event_button) or
+        modes.get(.mouse_event_any);
+}
+
+fn mouseReportLen(buf: []const u8) ?usize {
+    if (buf.len < 3 or buf[0] != '\x1b' or buf[1] != '[') return null;
+
+    // Legacy X10/normal mouse report: ESC [ M Cb Cx Cy
+    if (buf[2] == 'M') {
+        return @min(buf.len, 6);
+    }
+
+    // SGR mouse report: ESC [ < Cb ; Cx ; Cy M/m
+    if (buf[2] == '<') {
+        var j: usize = 3;
+        while (j < buf.len and (std.ascii.isDigit(buf[j]) or buf[j] == ';')) : (j += 1) {}
+        if (j > 3 and j < buf.len and (buf[j] == 'M' or buf[j] == 'm')) {
+            return j + 1;
+        }
+    }
+
+    return null;
+}
+
+/// Remove SGR (`\x1b[<...M`/`m`) and legacy (`\x1b[M` + 3 bytes) mouse reports
+/// from `payload` while preserving all other bytes in order.
+pub fn stripMouseInput(alloc: std.mem.Allocator, payload: []const u8) ![]const u8 {
+    var out = try std.ArrayList(u8).initCapacity(alloc, payload.len);
+    errdefer out.deinit(alloc);
+
+    var i: usize = 0;
+    while (i < payload.len) {
+        if (mouseReportLen(payload[i..])) |mouse_len| {
+            i += mouse_len;
+            continue;
+        }
+        try out.append(alloc, payload[i]);
+        i += 1;
+    }
+
+    return out.toOwnedSlice(alloc);
+}
+
 /// Detect if the payload contains user input that should be printed to the screen or
 /// is a key combination like up-arrow, backspace, enter, ctrl+f, etc.
 pub fn isUserInput(payload: []const u8) bool {
     var parser = ghostty_vt.Parser.init();
-    for (payload) |c| {
+    var i: usize = 0;
+    while (i < payload.len) {
+        if (mouseReportLen(payload[i..])) |mouse_len| {
+            parser = ghostty_vt.Parser.init();
+            i += mouse_len;
+            continue;
+        }
+        const c = payload[i];
+        i += 1;
         const actions = parser.next(c);
         for (actions) |action_opt| {
             const action = action_opt orelse continue;
             switch (action) {
                 .print => return true, // printable characters
                 .csi_dispatch => |csi| {
+                    // mouse events: CSI M (basic) or CSI < ... M/m (SGR extended) - EXCLUDE these
+                    // only intentional keyboard input should trigger leader switch
+                    if (csi.final == 'M' or (std.mem.eql(u8, csi.intermediates, "<") and (csi.final == 'M' or csi.final == 'm'))) continue;
+                    // focus events: CSI I (focus in) or CSI O (focus out) - EXCLUDE these
+                    // these are automatic terminal events, not user typing
+                    if (csi.final == 'I' or csi.final == 'O') continue;
                     // kitty keyboard: CSI ... u or CSI ... ~
                     // legacy modified keys: CSI 27 ; ... ~
                     // arrow/function keys with modifiers: CSI 1 ; <mod> A-D
                     if (csi.final == 'u' or csi.final == '~') return true;
                     // modified arrow keys (e.g., Ctrl+F sends CSI 1;5C in legacy mode)
                     if (csi.final >= 'A' and csi.final <= 'D' and csi.params.len > 1) return true;
-                    // mouse events: CSI M (basic) or CSI < (SGR extended) - EXCLUDE these
-                    // only intentional keyboard input should trigger leader switch
-                    if (csi.final == 'M' or csi.final == '<') return false;
-                    // focus events: CSI I (focus in) or CSI O (focus out) - EXCLUDE these
-                    // these are automatic terminal events, not user typing
-                    if (csi.final == 'I' or csi.final == 'O') return false;
                 },
                 .execute => |code| {
                     // looking for CR, LF, tab, and backspace
@@ -1576,15 +1630,77 @@ test "isUserInput: kitty keyboard sequences" {
 test "isUserInput: mouse events (CSI M) excluded" {
     // Basic mouse tracking (SGR disabled): CSI M Cb Cx Cy
     // Mouse events should NOT trigger leader switch
-    try testing.expect(!isUserInput("\x1b[M@ 0 0")); // button 0, pos 0,0
-    try testing.expect(!isUserInput("\x1b[M@ 1 1")); // button 1, pos 1,1
+    try testing.expect(!isUserInput("\x1b[M@00")); // button 0, pos 0,0
+    try testing.expect(!isUserInput("\x1b[M@11")); // button 1, pos 1,1
+    try testing.expect(!isUserInput("\x1b[M@!!")); // motion at 1,1
 }
 
 test "isUserInput: mouse events SGR mode CSI < excluded" {
-    // SGR extended mouse tracking: CSI < Cb;Cx;Y M
+    // SGR extended mouse tracking: CSI < Cb;Cx;Y M/m
     // Mouse events should NOT trigger leader switch
-    try testing.expect(!isUserInput("\x1b[<0;1;1M")); // button release
-    try testing.expect(!isUserInput("\x1b[<64;1;1M")); // button press
+    try testing.expect(!isUserInput("\x1b[<0;1;1M")); // button press
+    try testing.expect(!isUserInput("\x1b[<0;1;1m")); // button release
+    try testing.expect(!isUserInput("\x1b[<64;1;1M")); // wheel up
+    try testing.expect(!isUserInput("\x1b[<35;72;44M")); // mouse motion
+}
+
+test "isUserInput: mouse events followed by keyboard input" {
+    try testing.expect(isUserInput("\x1b[<35;72;44Ma"));
+    try testing.expect(isUserInput("\x1b[<0;1;1ma"));
+    try testing.expect(isUserInput("\x1b[M@!!a"));
+}
+
+test "isMouseTrackingEnabled: reflects DEC mouse tracking modes" {
+    const alloc = testing.allocator;
+    var term = try testCreateTerminal(alloc, 80, 24, "");
+    defer term.deinit(alloc);
+    var stream = term.vtStream();
+    defer stream.deinit();
+
+    try testing.expect(!isMouseTrackingEnabled(&term.modes));
+
+    inline for (.{
+        .{ "\x1b[?9h", "\x1b[?9l" },
+        .{ "\x1b[?1000h", "\x1b[?1000l" },
+        .{ "\x1b[?1002h", "\x1b[?1002l" },
+        .{ "\x1b[?1003h", "\x1b[?1003l" },
+    }) |pair| {
+        stream.nextSlice(pair[0]);
+        try testing.expect(isMouseTrackingEnabled(&term.modes));
+        stream.nextSlice(pair[1]);
+        try testing.expect(!isMouseTrackingEnabled(&term.modes));
+    }
+
+    stream.nextSlice("\x1b[?9;1000;1002;1003;1006h");
+    try testing.expect(isMouseTrackingEnabled(&term.modes));
+    stream.nextSlice(client_cleanup);
+    try testing.expect(!isMouseTrackingEnabled(&term.modes));
+}
+
+test "stripMouseInput: strips SGR and legacy mouse reports while preserving keyboard input" {
+    const alloc = testing.allocator;
+
+    const cases = [_]struct {
+        input: []const u8,
+        expected: []const u8,
+    }{
+        .{ .input = "\x1b[<35;72;44M", .expected = "" },
+        .{ .input = "\x1b[<0;1;1m", .expected = "" },
+        .{ .input = "\x1b[<35;72;44M\x1b[<35;73;44M\x1b[<0;73;44m", .expected = "" },
+        .{ .input = "\x1b[M@!!", .expected = "" },
+        .{ .input = "\x1b[M@", .expected = "" },
+        .{ .input = "\x1b[M", .expected = "" },
+        .{ .input = "\x1b[<35;72;44Mls -la\n", .expected = "ls -la\n" },
+        .{ .input = "ab\x1b[M@!!cd", .expected = "abcd" },
+        .{ .input = "\x1b[<999u", .expected = "\x1b[<999u" },
+        .{ .input = "x\x1b[<35;1;1My\x1b[<0;1;1mz", .expected = "xyz" },
+    };
+
+    for (cases) |case| {
+        const actual = try stripMouseInput(alloc, case.input);
+        defer alloc.free(actual);
+        try testing.expectEqualStrings(case.expected, actual);
+    }
 }
 
 test "isUserInput: focus events excluded" {
