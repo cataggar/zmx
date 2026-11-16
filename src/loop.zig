@@ -1939,8 +1939,8 @@ test "attachment: setup failures reject only the attaching client" {
     var saw_continuation_failure = false;
     var saw_unavailable = false;
     var saw_success = false;
-    for (0..3) |cut| {
-        for (0..if (cut == 2) @as(usize, 1) else 8) |fail_index| {
+    for (0..4) |cut| {
+        for (0..if (cut >= 2) @as(usize, 1) else 8) |fail_index| {
             var source = try ghostty_vt.Terminal.init(testing.io, testing.allocator, .{
                 .cols = 80,
                 .rows = 24,
