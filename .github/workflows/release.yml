@@ -27,7 +27,7 @@ jobs:
           - os: ubuntu-24.04
             target: x86_64-macos
             name: macos-x64
-          - os: macos-15
+          - os: ubuntu-24.04-arm
             target: aarch64-macos
             name: macos-arm64
 
