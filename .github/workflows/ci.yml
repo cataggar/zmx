@@ -1,0 +1,47 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          fetch-depth: 0
+
+      - name: Install Zig
+        shell: bash
+        run: bash .github/setup-zig.sh
+
+      - name: Build
+        run: zig build --summary all
+
+      - name: Run unit tests
+        run: zig build test --summary all
+
+      - name: Build ReleaseSafe integration binary
+        run: zig build -Doptimize=safe --prefix zig-out/integration --summary all
+
+      - name: Install integration test runner
+        run: sudo apt-get update -qq && sudo apt-get install -y bats zstd
+
+      - name: Verify deterministic .tzst packaging
+        shell: bash
+        run: |
+          mkdir -p zmx-ci-pkg/bin
+          cp zig-out/integration/bin/zmx zmx-ci-pkg/bin/zmx
+          cp LICENSE README.md zmx-ci-pkg/
+          SOURCE_DATE_EPOCH=1700000000 python3 scripts/pack.py zmx-ci-pkg zmx-ci-pkg-1.tzst
+          SOURCE_DATE_EPOCH=1700000000 python3 scripts/pack.py zmx-ci-pkg zmx-ci-pkg-2.tzst
+          cmp -s zmx-ci-pkg-1.tzst zmx-ci-pkg-2.tzst
+          rm -rf zmx-ci-pkg zmx-ci-pkg-1.tzst zmx-ci-pkg-2.tzst
+
+      - name: Run integration tests (ReleaseSafe)
+        env:
+          ZMX_TEST_BIN: ${{ github.workspace }}/zig-out/integration/bin/zmx
+        run: bats test

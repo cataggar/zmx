@@ -26,11 +26,27 @@ fn detectHelp(arg: []const u8) bool {
 /// Prints an error message to stderr and exits with status 1.
 fn printError(io: std.Io, comptime fmt: []const u8, args: anytype) noreturn {
     var buf: [4096]u8 = undefined;
-    var w = std.Io.File.stderr().writer(io, &buf);
+    var w = std.Io.File.stderr().writerStreaming(io, &buf);
     w.interface.print("error: " ++ fmt ++ "\n", args) catch {};
     w.interface.flush() catch {};
     std.process.exit(1);
 }
+
+fn cliUsageError(io: std.Io, message: []const u8) noreturn {
+    var buf: [512]u8 = undefined;
+    var w = std.Io.File.stderr().writerStreaming(io, &buf);
+    w.interface.print("error: {s}\n", .{message}) catch {};
+    w.interface.flush() catch {};
+    std.process.exit(2);
+}
+
+fn printCapabilities(io: std.Io) !void {
+    var buf: [128]u8 = undefined;
+    var w = std.Io.File.stdout().writerStreaming(io, &buf);
+    try w.interface.writeAll("zmx-capabilities-v1\nresume\npreserve-scrollback\n");
+    try w.interface.flush();
+}
+
 pub fn main(init: std.process.Init) !void {
     mainImpl(init) catch |err| switch (err) {
         error.Sighup => signal.reraise(.HUP),
@@ -54,6 +70,16 @@ fn mainImpl(init: std.process.Init) !void {
     defer args.deinit();
     _ = args.next(); // skip program name
 
+    const parsed_command = args.next();
+    // Capability discovery must not create directories, open logs, or contact
+    // a daemon. Exact output, not exit status, distinguishes it from old help.
+    if (parsed_command) |cmd| {
+        if (std.mem.eql(u8, cmd, "capabilities")) {
+            if (args.next() != null) cliUsageError(io, "usage: zmx capabilities");
+            return printCapabilities(io);
+        }
+    }
+
     var cfg = try Cfg.init(gpa, io);
     defer cfg.deinit(gpa);
 
@@ -65,7 +91,7 @@ fn mainImpl(init: std.process.Init) !void {
 
     const shell_env = init.environ_map.get("SHELL") orelse "/bin/sh";
 
-    const cmd = args.next() orelse {
+    const cmd = parsed_command orelse {
         return list(gpa, io, &cfg, false);
     };
 
@@ -159,6 +185,33 @@ fn mainImpl(init: std.process.Init) !void {
         const sesh = try socket.getSeshName(gpa, raw_name);
         defer gpa.free(sesh);
         return history(gpa, io, &cfg, sesh, format, scrollback_rows);
+    } else if (std.mem.eql(u8, cmd, "resume")) {
+        const session_name = args.next() orelse cliUsageError(io, "usage: zmx resume <name>");
+        if (args.next() != null or session_name.len == 0) cliUsageError(io, "usage: zmx resume <name>");
+        if (detectHelp(session_name)) {
+            return help(io);
+        }
+        // The legacy name-only Switch request can reach an older, creating
+        // client. Never delegate resume through it.
+        if (socket.getSeshNameFromEnv().len > 0) {
+            cliUsageError(io, "resume must be run outside a zmx session; detach first");
+        }
+
+        const env_keys = lib_posix.getenv("ZMX_TRACK_ENV") orelse cfg.tracked_envs;
+        const env_str = try getTrackedEnvStr(gpa, env_keys, init.environ_map);
+        defer gpa.free(env_str);
+
+        zmx.resumeSession(gpa, io, session_name, .{
+            .tracked_env = env_str,
+        }) catch |err| switch (err) {
+            error.Sighup, error.Sigint, error.Sigterm => return err,
+            else => return printError(
+                io,
+                "session \"{s}\" unavailable for resume ({s}); no session created",
+                .{ session_name, @errorName(err) },
+            ),
+        };
+        return;
     } else if (std.mem.eql(u8, cmd, "attach") or std.mem.eql(u8, cmd, "a")) {
         var attach_args: std.ArrayList([]const u8) = .empty;
         defer attach_args.deinit(gpa);
@@ -299,7 +352,7 @@ fn mainImpl(init: std.process.Init) !void {
         };
     } else if (std.mem.eql(u8, cmd, "kill") or std.mem.eql(u8, cmd, "k")) {
         var stderr_buffer: [1024]u8 = undefined;
-        var stderr_writer = std.Io.File.stderr().writer(io, &stderr_buffer);
+        var stderr_writer = std.Io.File.stderr().writerStreaming(io, &stderr_buffer);
         const stderr = &stderr_writer.interface;
 
         var matchers: std.ArrayList(socket.SessionMatch) = .empty;
@@ -456,6 +509,7 @@ fn help(io: std.Io) !void {
         \\
         \\Commands:
         \\  [a]ttach [--labels kv] <name> [command...]                 Attach to session, creating if needed
+        \\  resume <name>                                              Attach to an existing session only
         \\  [r]un <name> [-d] [command...]                             Send command without attaching
         \\  [s]end <name> <text...>                                    Send raw input to session PTY
         \\  [p]rint <name> <text...>                                   Inject text into session display
@@ -471,6 +525,7 @@ fn help(io: std.Io) !void {
         \\  [w]ait <name>...                                           Wait for session tasks to complete
         \\  [t]ail <name>...                                           Follow session output
         \\  [c]ompletions <shell>                                      Shell completions (bash, zsh, fish, nu, yash)
+        \\  capabilities                                               Print machine-readable capability lines
         \\  [v]ersion                                                  Show version and metadata (socket dir, log dir)
         \\  [h]elp                                                     Show this help
         \\
@@ -486,6 +541,18 @@ fn help(io: std.Io) !void {
         \\    zmx attach dev
         \\    zmx attach dev vim
         \\    zmx attach --labels "project=api role=worker" build
+        \\
+        \\Resume:
+        \\  Attaches only to an already-running session. It never spawns a daemon,
+        \\  starts a shell, accepts a command, or unlinks stale sockets.
+        \\
+        \\  Examples:
+        \\    zmx resume dev
+        \\
+        \\Capabilities:
+        \\  Prints `zmx-capabilities-v1` followed by supported capability tokens
+        \\  (`resume`, `preserve-scrollback`), one per line, without creating
+        \\  directories, opening logs, or contacting a daemon.
         \\
         \\History:
         \\  This should generally be used with `tail` to print the last lines
@@ -615,14 +682,14 @@ fn help(io: std.Io) !void {
         \\
     ;
     var buf: [8192]u8 = undefined;
-    var w = std.Io.File.stdout().writer(io, &buf);
+    var w = std.Io.File.stdout().writerStreaming(io, &buf);
     try w.interface.print(help_text, .{});
     try w.interface.flush();
 }
 
 fn printVersion(io: std.Io, cfg: *Cfg) !void {
     var buf: [256]u8 = undefined;
-    var w = std.Io.File.stdout().writer(io, &buf);
+    var w = std.Io.File.stdout().writerStreaming(io, &buf);
     try w.interface.print(
         "zmx\t\t{s}\nghostty_vt\t{s}\nsocket_dir\t{s}\nlog_dir\t\t{s}\n",
         .{ version, ghostty_version, cfg.socket_dir, cfg.log_dir },
@@ -633,7 +700,7 @@ fn printVersion(io: std.Io, cfg: *Cfg) !void {
 fn printCompletions(io: std.Io, shell: completions.Shell) !void {
     const script = shell.getCompletionScript();
     var buf: [8192]u8 = undefined;
-    var w = std.Io.File.stdout().writer(io, &buf);
+    var w = std.Io.File.stdout().writerStreaming(io, &buf);
     try w.interface.print("{s}\n", .{script});
     try w.interface.flush();
 }
@@ -641,11 +708,11 @@ fn printCompletions(io: std.Io, shell: completions.Shell) !void {
 fn wait(alloc: std.mem.Allocator, io: std.Io, cfg: *Cfg, matchers: std.ArrayList(socket.SessionMatch)) !void {
     _ = cfg;
     var stdout_buffer: [1024]u8 = undefined;
-    var stdout_writer = std.Io.File.stdout().writer(io, &stdout_buffer);
+    var stdout_writer = std.Io.File.stdout().writerStreaming(io, &stdout_buffer);
     const stdout = &stdout_writer.interface;
 
     var stderr_buffer: [1024]u8 = undefined;
-    var stderr_writer = std.Io.File.stderr().writer(io, &stderr_buffer);
+    var stderr_writer = std.Io.File.stderr().writerStreaming(io, &stderr_buffer);
     const stderr = &stderr_writer.interface;
 
     // Highest match count seen so far. Lets us distinguish "sessions haven't
@@ -827,7 +894,7 @@ fn wait(alloc: std.mem.Allocator, io: std.Io, cfg: *Cfg, matchers: std.ArrayList
 fn list(alloc: std.mem.Allocator, io: std.Io, cfg: *Cfg, short: bool) !void {
     const current_session = socket.getSeshNameFromEnv();
     var buf: [4096]u8 = undefined;
-    var stdout = std.Io.File.stdout().writer(io, &buf);
+    var stdout = std.Io.File.stdout().writerStreaming(io, &buf);
     const sessions = try zmx.list(alloc, io);
     defer {
         for (sessions) |session| {
@@ -839,7 +906,7 @@ fn list(alloc: std.mem.Allocator, io: std.Io, cfg: *Cfg, short: bool) !void {
     if (sessions.len == 0) {
         if (short) return;
         var errbuf: [4096]u8 = undefined;
-        var stderr = std.Io.File.stderr().writer(io, &errbuf);
+        var stderr = std.Io.File.stderr().writerStreaming(io, &errbuf);
         try stderr.interface.print("no sessions found in {s}\n", .{cfg.socket_dir});
         try stderr.interface.flush();
         return;
@@ -878,21 +945,21 @@ fn kill(alloc: std.mem.Allocator, io: std.Io, cfg: *Cfg, session_name: []const u
 
     if (status == .cleaned_stale) {
         var ebuf: [4096]u8 = undefined;
-        var ew = std.Io.File.stderr().writer(io, &ebuf);
+        var ew = std.Io.File.stderr().writerStreaming(io, &ebuf);
         ew.interface.print("cleaned up stale session {s}\n", .{session_name}) catch {};
         ew.interface.flush() catch {};
         return;
     }
 
     var buf: [100]u8 = undefined;
-    var w = std.Io.File.stdout().writer(io, &buf);
+    var w = std.Io.File.stdout().writerStreaming(io, &buf);
     try w.interface.print("killed session {s}\n", .{session_name});
     try w.interface.flush();
 }
 
 fn printLabelError(io: std.Io, session_name: []const u8, err: anyerror) noreturn {
     var buf: [4096]u8 = undefined;
-    var w = std.Io.File.stderr().writer(io, &buf);
+    var w = std.Io.File.stderr().writerStreaming(io, &buf);
     switch (err) {
         error.Timeout => w.interface.print(
             "error: session \"{s}\" does not support labels (daemon too old?)\n",
@@ -925,7 +992,7 @@ fn labelGet(alloc: std.mem.Allocator, io: std.Io, cfg: *Cfg, session_name: []con
     defer alloc.free(val);
 
     var buf: [4096]u8 = undefined;
-    var stdout = std.Io.File.stdout().writer(io, &buf);
+    var stdout = std.Io.File.stdout().writerStreaming(io, &buf);
     try stdout.interface.print("{s}", .{val});
     try stdout.interface.flush();
 }
@@ -938,7 +1005,7 @@ fn assertLabels(io: std.Io, labels: []const u8) void {
     while (kvs.next()) |kv| {
         label.assertLabel(kv.key, kv.value) catch |err| {
             var buf: [4096]u8 = undefined;
-            var w = std.Io.File.stderr().writer(io, &buf);
+            var w = std.Io.File.stderr().writerStreaming(io, &buf);
             const msg = "error: key-value kvs can only contain [a-z, A-Z, 0-9, -_.] characters";
             switch (err) {
                 error.LabelKeyEmpty => {
@@ -1024,7 +1091,7 @@ fn getEnvValue(key: []const u8, payload: []const u8) error{EnvVarNotFound}![]con
 
 fn printEnvError(io: std.Io, session_name: []const u8, err: anyerror) noreturn {
     var buf: [4096]u8 = undefined;
-    var w = std.Io.File.stderr().writer(io, &buf);
+    var w = std.Io.File.stderr().writerStreaming(io, &buf);
     switch (err) {
         error.SessionNotFound => w.interface.print("error: session \"{s}\" not found\n", .{session_name}) catch {},
         error.DaemonUnresponsive => w.interface.print("error: session \"{s}\" daemon unresponsive\n", .{session_name}) catch {},
@@ -1049,7 +1116,7 @@ fn envGet(alloc: std.mem.Allocator, io: std.Io, cfg: *Cfg, session_name: []const
     defer alloc.free(payload);
 
     var buf: [4096]u8 = undefined;
-    var stdout = std.Io.File.stdout().writer(io, &buf);
+    var stdout = std.Io.File.stdout().writerStreaming(io, &buf);
     if (single_kv.len > 0) {
         try stdout.interface.print("{s}\n", .{payload});
         try stdout.interface.flush();
@@ -1188,7 +1255,7 @@ fn writeFile(gpa: std.mem.Allocator, io: std.Io, session_name: []const u8, file_
     zmx.write(gpa, io, session_name, file_path, stdin_buf.items) catch |err| {
         if (err == error.SessionUnresponsive) {
             var errbuf: [4096]u8 = undefined;
-            var ew = std.Io.File.stderr().writer(io, &errbuf);
+            var ew = std.Io.File.stderr().writerStreaming(io, &errbuf);
             ew.interface.print("session {s} is unresponsive\ndaemon may be busy: try again\n", .{session_name}) catch {};
             ew.interface.flush() catch {};
             return error.SessionUnresponsive;
@@ -1197,7 +1264,7 @@ fn writeFile(gpa: std.mem.Allocator, io: std.Io, session_name: []const u8, file_
     };
 
     var buf: [4096]u8 = undefined;
-    var w = std.Io.File.stdout().writer(io, &buf);
+    var w = std.Io.File.stdout().writerStreaming(io, &buf);
     try w.interface.print("file created {s}\n", .{file_path});
     try w.interface.flush();
 }
@@ -1247,7 +1314,7 @@ fn send(alloc: std.mem.Allocator, io: std.Io, session_name: []const u8, text_par
     res catch |err| {
         if (err == error.SessionUnresponsive) {
             var errbuf: [4096]u8 = undefined;
-            var ew = std.Io.File.stderr().writer(io, &errbuf);
+            var ew = std.Io.File.stderr().writerStreaming(io, &errbuf);
             ew.interface.print("session {s} is unresponsive\ndaemon may be busy: try again\n", .{session_name}) catch {};
             ew.interface.flush() catch {};
             return error.SessionUnresponsive;

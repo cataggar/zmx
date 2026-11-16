@@ -2,7 +2,7 @@
 
 ## prerequisites
 
-- [Zig](https://ziglang.org/) `0.17.0`
+- [Zig](https://ziglang.org/) `0.17.1`
 - [bats-core](https://github.com/bats-core/bats-core) (integration tests)
 - [Go](https://go.dev/) `1.23+` (docs site)
 

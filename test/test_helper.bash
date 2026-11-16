@@ -3,32 +3,48 @@
 REPO_DIR="$(cd "$BATS_TEST_DIRNAME/.." && pwd)"
 
 setup() {
-  ZMX="${ZMX:-$REPO_DIR/zig-out/bin/zmx}"
-
-  # Build once per test suite (skips if already built)
-  if [[ ! -x "$ZMX" ]]; then
-    local os
-    os="$(uname -s | tr '[:upper:]' '[:lower:]')"
-    local arch
-    arch="$(uname -m)"
-    local dist_tar
-    dist_tar=$(ls -1t "$REPO_DIR/zig-out/dist/zmx-"*"-${os}-${arch}.tar.gz" 2>/dev/null | head -n1 || true)
-    if [[ -n "$dist_tar" && -f "$dist_tar" ]]; then
-      mkdir -p "$(dirname "$ZMX")"
-      tar -xzf "$dist_tar" -C "$(dirname "$ZMX")"
-    else
-      cd "$REPO_DIR" && zig build
+  # A rejected override must not leave an inherited executable for teardown.
+  ZMX=""
+  if [[ -n "${ZMX_TEST_BIN+x}" ]]; then
+    if [[ "$ZMX_TEST_BIN" != /* || ! -f "$ZMX_TEST_BIN" || ! -x "$ZMX_TEST_BIN" ]]; then
+      printf 'ZMX_TEST_BIN must name an absolute regular executable file\n' >&2
+      return 1
+    fi
+    ZMX="$ZMX_TEST_BIN"
+  else
+    ZMX="$REPO_DIR/zig-out/bin/zmx"
+    # Build once per test suite (skips if already built)
+    if [[ ! -x "$ZMX" ]]; then
+      local os
+      os="$(uname -s | tr '[:upper:]' '[:lower:]')"
+      local arch
+      arch="$(uname -m)"
+      local dist_tar
+      dist_tar=$(ls -1t "$REPO_DIR/zig-out/dist/zmx-"*"-${os}-${arch}.tzst" 2>/dev/null | head -n1 || true)
+      if [[ -n "$dist_tar" && -f "$dist_tar" ]]; then
+        mkdir -p "$(dirname "$ZMX")"
+        tar --zstd -xf "$dist_tar" -C "$(dirname "$ZMX")" --strip-components=1
+      else
+        cd "$REPO_DIR" && zig build
+      fi
     fi
   fi
 
   # Isolate socket dir so tests don't interfere with real sessions or each other
-  export ZMX_DIR="$BATS_TEST_TMPDIR/zmx-sockets"
-  mkdir -p "$ZMX_DIR"
+  if [[ -n "${ZMX_TEST_SOCKET_ROOT:-}" ]]; then
+    # Optional existing, empty short-path directory for long checkout paths.
+    local suite="${BATS_TEST_FILENAME##*/}"
+    export ZMX_DIR="$ZMX_TEST_SOCKET_ROOT/${suite%.bats}-$BATS_TEST_NUMBER"
+    mkdir "$ZMX_DIR"
+  else
+    export ZMX_DIR="$BATS_TEST_TMPDIR/zmx-sockets"
+    mkdir -p "$ZMX_DIR"
+  fi
 }
 
 teardown() {
   # Kill any sessions created during this test
-  if [[ -d "$ZMX_DIR" ]]; then
+  if [[ -n "${ZMX:-}" && -d "${ZMX_DIR:-}" ]]; then
     local sessions
     sessions=$("$ZMX" list --short 2>/dev/null) || true
     if [[ -n "$sessions" ]]; then

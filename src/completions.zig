@@ -35,7 +35,7 @@ const bash_completions =
     \\  cur="${COMP_WORDS[COMP_CWORD]}"
     \\  prev="${COMP_WORDS[COMP_CWORD-1]}"
     \\
-    \\  local commands="attach run send print write detach list kill history get set clear print-env wait tail completions version help"
+    \\  local commands="attach resume capabilities run send print write detach list kill history get set clear print-env wait tail completions version help"
     \\
     \\  if [[ $COMP_CWORD -eq 1 ]]; then
     \\    COMPREPLY=($(compgen -W "$commands" -- "$cur"))
@@ -43,7 +43,7 @@ const bash_completions =
     \\  fi
     \\
     \\  case "$prev" in
-    \\    attach|run|send|print|write|kill|get|set|clear|print-env|wait|tail)
+    \\    attach|resume|run|send|print|write|kill|get|set|clear|print-env|wait|tail)
     \\      local sessions=$(zmx list --short 2>/dev/null | tr '\n' ' ')
     \\      COMPREPLY=($(compgen -W "$sessions" -- "$cur"))
     \\      ;;
@@ -82,6 +82,8 @@ const zsh_completions =
     \\      local -a commands
     \\      commands=(
     \\        'attach:Attach to session, creating if needed'
+    \\        'resume:Attach to existing session without creating'
+    \\        'capabilities:Print machine-readable capabilities'
     \\        'run:Send command without attaching'
     \\        'send:Send raw input to session PTY'
     \\        'print:Inject text into session display'
@@ -104,7 +106,7 @@ const zsh_completions =
     \\      ;;
     \\    args)
     \\      case $words[2] in
-    \\        attach|a|kill|k|run|r|send|s|print|p|write|wr|get|g|set|clear|print-env|wait|w|tail|t)
+    \\        attach|a|resume|kill|k|run|r|send|s|print|p|write|wr|get|g|set|clear|print-env|wait|w|tail|t)
     \\          _zmx_sessions
     \\          ;;
     \\        history|hi)
@@ -148,6 +150,8 @@ const fish_completions =
     \\
     \\# zmx subcommands
     \\complete -c zmx -n "__fish_is_nth_token 1" -a attach -d 'Attach to session, creating if needed'
+    \\complete -c zmx -n "__fish_is_nth_token 1" -a resume -d 'Attach to existing session without creating'
+    \\complete -c zmx -n "__fish_is_nth_token 1" -a capabilities -d 'Print machine-readable capabilities'
     \\complete -c zmx -n "__fish_is_nth_token 1" -a run -d 'Send command without attaching'
     \\complete -c zmx -n "__fish_is_nth_token 1" -a send -d 'Send raw input to session PTY'
     \\complete -c zmx -n "__fish_is_nth_token 1" -a print -d 'Inject text into session display'
@@ -167,7 +171,7 @@ const fish_completions =
     \\complete -c zmx -n "__fish_is_nth_token 1" -a help -d 'Show help message'
     \\
     \\# Complete session names and shells
-    \\complete -c zmx -n "__fish_is_nth_token 2; and __fish_seen_subcommand_from a attach r run s send p print wr write hi history g get se set cl clear print-env" -a '(zmx list --short 2>/dev/null)' -d 'Session name'
+    \\complete -c zmx -n "__fish_is_nth_token 2; and __fish_seen_subcommand_from a attach resume r run s send p print wr write hi history g get se set cl clear print-env" -a '(zmx list --short 2>/dev/null)' -d 'Session name'
     \\complete -c zmx -n "not __fish_is_nth_token 1; and __fish_seen_subcommand_from k kill w wait t tail" -a '(zmx list --short 2>/dev/null)' -d 'Session name'
     \\
     \\complete -c zmx -n "__fish_is_nth_token 2; and __fish_seen_subcommand_from c completions" -a 'bash zsh fish nu yash' -d Shell
@@ -199,6 +203,12 @@ const nu_completions =
     \\    --labels: string
     \\    ...rest: string
     \\]
+    \\
+    \\export extern "zmx resume" [
+    \\    name: string@"nu-complete zmx sessions"
+    \\]
+    \\
+    \\export extern "zmx capabilities" []
     \\
     \\export extern "zmx run" [
     \\    name: string@"nu-complete zmx sessions"
@@ -278,6 +288,14 @@ const yash_completions =
     \\            (a|attach)
     \\                command -f completion/zmx::attach:arg
     \\                ;;
+    \\            (resume)
+    \\                command -f completion//getoperands
+    \\                if [ ${WORDS[#]} -eq 1 ]; then
+    \\                    command -f completion/zmx::sessions
+    \\                fi
+    \\                ;;
+    \\            (capabilities)
+    \\                ;;
     \\            (r|run)
     \\                command -f completion/zmx::run:arg
     \\                ;;
@@ -330,6 +348,8 @@ const yash_completions =
     \\
     \\function completion/zmx::completecmd {
     \\    complete -P "$PREFIX" -D "Attach to session, creating if needed" attach a
+    \\    complete -P "$PREFIX" -D "Attach to existing session without creating" resume
+    \\    complete -P "$PREFIX" -D "Print machine-readable capabilities" capabilities
     \\    complete -P "$PREFIX" -D "Send command without attaching" run r
     \\    complete -P "$PREFIX" -D "Send raw input to session PTY" send s
     \\    complete -P "$PREFIX" -D "Inject text into session display" print p

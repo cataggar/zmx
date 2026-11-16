@@ -14,7 +14,7 @@ pub fn zmxLogFn(
 
 pub const LogSystem = struct {
     file: ?std.Io.File = null,
-    mutex: std.Io.Mutex = .init,
+    mutex: std.atomic.Mutex = .unlocked,
     current_size: u64 = 0,
     max_size: u64 = 2 * 1024 * 1024, // 2MB
     path: []const u8 = "",
@@ -50,7 +50,12 @@ pub const LogSystem = struct {
     }
 
     pub fn deinit(self: *LogSystem) void {
-        if (self.file) |f| std.Io.File.close(f, self.io);
+        if (self.file) |f| {
+            std.Io.File.close(f, self.io);
+            // std.start reports main's error after main's defers have run.
+            self.file = null;
+        }
+        self.path = "";
     }
 
     pub fn log(
@@ -60,8 +65,10 @@ pub const LogSystem = struct {
         comptime format: []const u8,
         args: anytype,
     ) !void {
-        try self.mutex.lock(self.io);
-        defer self.mutex.unlock(self.io);
+        while (!self.mutex.tryLock()) {
+            std.atomic.spinLoopHint();
+        }
+        defer self.mutex.unlock();
 
         if (self.file == null) {
             std.log.defaultLog(level, scope, format, args);
@@ -117,3 +124,27 @@ pub const LogSystem = struct {
         self.current_size = 0;
     }
 };
+
+test "LogSystem deinit releases ownership and can repeat" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var logger = LogSystem{
+        .io = std.testing.io,
+        .path = "logger.log",
+        .file = try tmp.dir.createFile(std.testing.io, "logger.log", .{}),
+    };
+
+    logger.deinit();
+    try std.testing.expect(logger.file == null);
+    try std.testing.expectEqualStrings("", logger.path);
+    logger.deinit();
+}
+
+test "LogSystem deinit accepts an unused logger" {
+    var logger = LogSystem{};
+    logger.deinit();
+    logger.deinit();
+    try std.testing.expect(logger.file == null);
+    try std.testing.expectEqualStrings("", logger.path);
+}

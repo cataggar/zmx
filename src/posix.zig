@@ -245,6 +245,9 @@ const ConnectError = error{
 
     /// Socket is non-blocking and already has a pending connection in progress.
     ConnectionPending,
+
+    /// The given AF_UNIX path exists, but is not a Unix domain socket.
+    FileNotUnixSocket,
 } || UnexpectedError;
 
 /// Initiate a connection on a socket.
@@ -269,7 +272,10 @@ pub fn connect(sock: socket_t, sock_addr: *const sockaddr, len: socklen_t) Conne
             .ISCONN => unreachable, // The socket is already connected.
             .HOSTUNREACH => return error.NetworkUnreachable,
             .NETUNREACH => return error.NetworkUnreachable,
-            .NOTSOCK => unreachable, // The file descriptor sockfd does not refer to a socket.
+            .NOTSOCK, .OPNOTSUPP => {
+                if (sock_addr.family == AF.UNIX) return error.FileNotUnixSocket;
+                unreachable; // The file descriptor sockfd does not refer to a socket.
+            },
             .PROTOTYPE => unreachable, // The socket type does not support the requested communications protocol.
             .TIMEDOUT => return error.ConnectionTimedOut,
             .NOENT => return error.FileNotFound, // Returned when socket is AF.UNIX and the given path does not exist.

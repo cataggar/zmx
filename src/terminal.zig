@@ -5,13 +5,84 @@ const testing = std.testing;
 const has_daemon = if (@hasDecl(build_options, "has_daemon")) build_options.has_daemon else true;
 pub const ghostty_vt = if (has_daemon) @import("ghostty-vt") else struct {
     pub const Terminal = struct {};
+    pub const TerminalStream = struct {};
     pub const Parser = struct {};
     pub const Selection = struct {};
     pub const formatter = struct {};
     pub const color = struct {};
+    pub const modes = struct {
+        pub const ModeState = struct {};
+    };
+    pub const snapshot = struct {
+        pub const continuation = struct {};
+    };
 };
 
 pub const HistoryFormat = util.HistoryFormat;
+
+/// True when any DEC mouse tracking mode is active in the session terminal:
+/// ?9 (X10), ?1000 (normal click), ?1002 (button-event drag), or ?1003 (any-event motion).
+/// Encoding modes such as ?1006 (SGR) only change report formatting and do not enable reporting.
+pub fn isMouseTrackingEnabled(modes: *const ghostty_vt.modes.ModeState) bool {
+    return modes.get(.mouse_event_x10) or
+        modes.get(.mouse_event_normal) or
+        modes.get(.mouse_event_button) or
+        modes.get(.mouse_event_any);
+}
+
+/// Returns the byte length of a complete mouse report sequence starting at `buf[0]`,
+/// or null if `buf` does not begin with a complete SGR or legacy X10/normal mouse report.
+///
+/// Recognized sequences:
+/// - SGR mouse (`?1006`): `ESC [ < Cb ; Cx ; Cy M` (press/motion) or `... m` (release)
+/// - X10 / normal mouse (`?9` / `?1000` / `?1002` / `?1003` without SGR): `ESC [ M Cb Cx Cy` (6 bytes)
+fn mouseReportLen(buf: []const u8) ?usize {
+    if (buf.len < 6 or buf[0] != 0x1b or buf[1] != '[') return null;
+
+    // Legacy X10 / normal mouse report: ESC [ M followed by 3 raw coordinate/button bytes.
+    if (buf[2] == 'M') {
+        return 6;
+    }
+
+    // SGR mouse report: ESC [ < digits ; digits ; digits (M | m)
+    if (buf[2] == '<') {
+        var pos: usize = 3;
+        for (0..3) |param_idx| {
+            const start = pos;
+            while (pos < buf.len and std.ascii.isDigit(buf[pos])) : (pos += 1) {}
+            if (pos == start) return null;
+            if (param_idx < 2) {
+                if (pos >= buf.len or buf[pos] != ';') return null;
+                pos += 1;
+            }
+        }
+        if (pos < buf.len and (buf[pos] == 'M' or buf[pos] == 'm')) {
+            return pos + 1;
+        }
+    }
+
+    return null;
+}
+
+/// Allocates a copy of `payload` with all complete SGR and X10/normal mouse report
+/// sequences removed. Non-mouse bytes (including normal typing or control keys in the
+/// same read) are preserved verbatim. Caller owns the returned slice.
+pub fn stripMouseInput(alloc: std.mem.Allocator, payload: []const u8) ![]const u8 {
+    var out = try std.ArrayList(u8).initCapacity(alloc, payload.len);
+    errdefer out.deinit(alloc);
+
+    var i: usize = 0;
+    while (i < payload.len) {
+        if (mouseReportLen(payload[i..])) |len| {
+            i += len;
+            continue;
+        }
+        try out.append(alloc, payload[i]);
+        i += 1;
+    }
+
+    return out.toOwnedSlice(alloc);
+}
 
 /// True when a CSI carries a private marker (`?`, `>`, `=`, `<`). Keyboard
 /// encodings never use one, but the replies a terminal sends on its own do:
@@ -34,6 +105,15 @@ pub fn isUserInput(payload: []const u8) bool {
     var parser = ghostty_vt.Parser.init();
     var i: usize = 0;
     while (i < payload.len) {
+        // Skip complete SGR (`CSI < ... M/m`) and X10 (`CSI M Cb Cx Cy`) mouse
+        // reports up front so raw X10 coordinate bytes are never misread as
+        // printable typing and trailing keystrokes in the same read still count.
+        if (mouseReportLen(payload[i..])) |mouse_len| {
+            parser = ghostty_vt.Parser.init();
+            i += mouse_len;
+            continue;
+        }
+
         if (payload[i] == 0x1b and i + 2 < payload.len and payload[i + 1] == '[') {
             if (util.parseKittyCsiU(payload[i + 2 ..])) |kitty| {
                 if (kitty.event_type != 3) return true;
@@ -48,6 +128,14 @@ pub fn isUserInput(payload: []const u8) bool {
             switch (action) {
                 .print => return true, // printable characters
                 .csi_dispatch => |csi| {
+                    // Mouse events (`CSI M` or `CSI < ... M/m`) and focus events
+                    // (`CSI I` / `CSI O`) are automatic or non-keyboard events:
+                    // skip them and continue scanning for real keyboard input.
+                    const is_sgr_mouse = csi.intermediates.len == 1 and
+                        csi.intermediates[0] == '<' and
+                        (csi.final == 'M' or csi.final == 'm');
+                    if (csi.final == 'M' or is_sgr_mouse) continue;
+                    if (csi.final == 'I' or csi.final == 'O') continue;
                     // A reply, not a key: skip it and keep scanning, since a
                     // real keystroke can arrive in the same read.
                     if (hasPrivateMarker(csi)) continue;
@@ -60,12 +148,6 @@ pub fn isUserInput(payload: []const u8) bool {
                     if (!status_reply and (csi.final == 'u' or csi.final == '~')) return true;
                     // modified arrow keys (e.g., Ctrl+F sends CSI 1;5C in legacy mode)
                     if (csi.final >= 'A' and csi.final <= 'D' and csi.params.len > 1) return true;
-                    // mouse events: CSI M (basic) or CSI < (SGR extended) - EXCLUDE these
-                    // only intentional keyboard input should trigger leader switch
-                    if (csi.final == 'M' or csi.final == '<') return false;
-                    // focus events: CSI I (focus in) or CSI O (focus out) - EXCLUDE these
-                    // these are automatic terminal events, not user typing
-                    if (csi.final == 'I' or csi.final == 'O') return false;
                 },
                 .execute => |code| {
                     // looking for CR, LF, tab, and backspace
@@ -130,6 +212,14 @@ fn writeCursorStyle(writer: *std.Io.Writer, term: *ghostty_vt.Terminal) !void {
 }
 
 pub fn serializeTerminalState(alloc: std.mem.Allocator, term: *ghostty_vt.Terminal) ?[]const u8 {
+    return serializeTerminalStateForClient(alloc, term, term.rows);
+}
+
+pub fn serializeTerminalStateForClient(
+    alloc: std.mem.Allocator,
+    term: *ghostty_vt.Terminal,
+    client_rows: u16,
+) ?[]const u8 {
     var builder: std.Io.Writer.Allocating = .init(alloc);
     defer builder.deinit();
 
@@ -186,8 +276,10 @@ pub fn serializeTerminalState(alloc: std.mem.Allocator, term: *ghostty_vt.Termin
 
         // The formatter leaves its final history rows in the viewport. Move
         // every one into scrollback before clearing that viewport, including
-        // when the entire history is shorter than the terminal height.
-        for (0..pages.rows) |_| builder.writer.writeAll("\r\n") catch |err| {
+        // when the entire history is shorter than the terminal height or when
+        // an attaching non-leader client has more rows than the session grid.
+        const flush_rows: usize = @max(pages.rows, client_rows);
+        for (0..flush_rows) |_| builder.writer.writeAll("\r\n") catch |err| {
             std.log.warn("failed to preserve scrollback err={s}", .{@errorName(err)});
             return null;
         };
@@ -949,17 +1041,153 @@ test "isUserInput: kitty keyboard sequences" {
 }
 
 test "isUserInput: mouse events (CSI M) excluded" {
-    // Basic mouse tracking (SGR disabled): CSI M Cb Cx Cy
+    // Basic mouse tracking (SGR disabled): CSI M Cb Cx Cy (exact 3 raw bytes)
     // Mouse events should NOT trigger leader switch
-    try testing.expect(!isUserInput("\x1b[M@ 0 0")); // button 0, pos 0,0
-    try testing.expect(!isUserInput("\x1b[M@ 1 1")); // button 1, pos 1,1
+    try testing.expect(!isUserInput("\x1b[M@00")); // button 0, pos 0,0
+    try testing.expect(!isUserInput("\x1b[M@11")); // button 1, pos 1,1
 }
 
 test "isUserInput: mouse events SGR mode CSI < excluded" {
-    // SGR extended mouse tracking: CSI < Cb;Cx;Y M
+    // SGR extended mouse tracking: CSI < Cb;Cx;Y M/m
     // Mouse events should NOT trigger leader switch
-    try testing.expect(!isUserInput("\x1b[<0;1;1M")); // button release
-    try testing.expect(!isUserInput("\x1b[<64;1;1M")); // button press
+    try testing.expect(!isUserInput("\x1b[<0;1;1M")); // button press
+    try testing.expect(!isUserInput("\x1b[<0;1;1m")); // button release
+    try testing.expect(!isUserInput("\x1b[<35;80;24M")); // motion without button
+    try testing.expect(!isUserInput("\x1b[<64;1;1M")); // wheel up
+}
+
+test "isUserInput: mouse events followed by keyboard input" {
+    // Mouse motion/release in the same read buffer must not mask a real keystroke
+    try testing.expect(isUserInput("\x1b[<35;10;5Ma"));
+    try testing.expect(isUserInput("\x1b[<0;10;5m\r"));
+    try testing.expect(isUserInput("\x1b[M@00x"));
+    try testing.expect(!isUserInput("\x1b[<35;10;5M\x1b[<0;10;5m\x1b[M@00"));
+}
+
+test "isMouseTrackingEnabled reflects DEC mouse tracking modes" {
+    var term = try ghostty_vt.Terminal.init(testing.io, testing.allocator, .{ .cols = 80, .rows = 24 });
+    defer term.deinit(testing.allocator);
+    var stream = term.vtStream();
+    defer stream.deinit();
+
+    try testing.expect(!isMouseTrackingEnabled(&term.modes));
+
+    // SGR encoding alone (?1006h) does not enable mouse tracking.
+    stream.nextSlice("\x1b[?1006h");
+    try testing.expect(!isMouseTrackingEnabled(&term.modes));
+
+    for ([_][]const u8{ "\x1b[?9h", "\x1b[?1000h", "\x1b[?1002h", "\x1b[?1003h" }, [_][]const u8{ "\x1b[?9l", "\x1b[?1000l", "\x1b[?1002l", "\x1b[?1003l" }) |enable, disable| {
+        stream.nextSlice(enable);
+        try testing.expect(isMouseTrackingEnabled(&term.modes));
+        stream.nextSlice(disable);
+        try testing.expect(!isMouseTrackingEnabled(&term.modes));
+    }
+}
+
+test "stripMouseInput removes SGR and X10 mouse reports while preserving keyboard input" {
+    const alloc = testing.allocator;
+
+    const only_mouse = try stripMouseInput(alloc, "\x1b[<35;120;34M\x1b[<0;120;34m\x1b[M@!!");
+    defer alloc.free(only_mouse);
+    try testing.expectEqualStrings("", only_mouse);
+
+    const mixed = try stripMouseInput(alloc, "ls\x1b[<35;10;20M -la\x1b[M@00\r\x1b[<0;10;20m");
+    defer alloc.free(mixed);
+    try testing.expectEqualStrings("ls -la\r", mixed);
+
+    const keys_only = try stripMouseInput(alloc, "\x1b[A\x1b[102;1:1uhello");
+    defer alloc.free(keys_only);
+    try testing.expectEqualStrings("\x1b[A\x1b[102;1:1uhello", keys_only);
+}
+
+test "client cleanup preserves parsed primary history and restores terminal modes" {
+    const alloc = testing.allocator;
+    var term = try testCreateTerminal(alloc, testing.io, 80, 6, "");
+    defer term.deinit(alloc);
+
+    {
+        var stream = term.vtStream();
+        defer stream.deinit();
+        var buf: [32]u8 = undefined;
+        for (0..18) |i| {
+            stream.nextSlice(try std.fmt.bufPrint(&buf, "HIST_{d}\r\n", .{i}));
+        }
+        stream.nextSlice("PROMPT_BEFORE_TUI");
+
+        // Dirty every terminal state class that an interrupted session can leave:
+        // alternate screen, kitty keyboard flags on both screens, xterm
+        // modifyOtherKeys, mouse/focus/paste/sync/resize modes, cursor/wrap,
+        // SGR, dynamic colors, OSC 8 hyperlink, scroll region, charset, and an
+        // unterminated control string.
+        stream.nextSlice(
+            "\x1b[>7u" ++
+                "\x1b[?1049h" ++
+                "\x1b[>15u" ++
+                "\x1b[>4;2m" ++
+                "\x1b[?1;5;6;45;66;67;69;1045h" ++
+                "\x1b[?9;1000;1002;1003;1004;1005;1006;1015;1016h" ++
+                "\x1b[?2004;2026;2031;2033;2048h" ++
+                "\x1b[2;4;20h\x1b[12l\x1b[?7;25l" ++
+                "\x1b[2;4r\x1b[3;10H\x1b[5 q\x1b[1\"q" ++
+                "\x1b[1;31;44m\x1b]10;rgb:11/22/33\x1b\\\x1b]11;rgb:44/55/66\x1b\\\x1b]12;rgb:77/88/99\x1b\\" ++
+                "\x1b]8;;https://example.invalid\x1b\\" ++
+                "\x1b(0\x0eqqq" ++
+                "\x1b]2;unterminated title",
+        );
+        try testing.expectEqual(.alternate, term.screens.active_key);
+        try testing.expect(term.colors.foreground.override != null);
+        try testing.expect(term.colors.background.override != null);
+        try testing.expect(term.colors.cursor.override != null);
+
+        stream.nextSlice(util.client_cleanup);
+        stream.nextSlice("AFTER_DETACH");
+    }
+
+    try testing.expectEqual(@as(?usize, null), std.mem.indexOf(u8, util.client_cleanup, "\x1bc"));
+    try testing.expectEqual(@as(?usize, null), std.mem.indexOf(u8, util.client_cleanup, "\x1b[3J"));
+    try testing.expectEqual(.primary, term.screens.active_key);
+
+    const history = try term.screens.active.dumpStringAlloc(alloc, .{ .screen = .{ .x = 0, .y = 0 } });
+    defer alloc.free(history);
+    try testing.expect(std.mem.indexOf(u8, history, "HIST_0") != null);
+    try testing.expect(std.mem.indexOf(u8, history, "HIST_17") != null);
+    try testing.expect(std.mem.indexOf(u8, history, "PROMPT_BEFORE_TUI") != null);
+    try testing.expect(std.mem.indexOf(u8, history, "AFTER_DETACH") != null);
+    try testing.expectEqual(@as(?usize, null), std.mem.indexOf(u8, history, "unterminated title"));
+
+    try testing.expectEqual(@TypeOf(term.modes.values){}, term.modes.values);
+    try testing.expectEqual(@as(u5, 0), @as(u5, @bitCast(term.screens.active.kitty_keyboard.current())));
+    try testing.expect(!term.flags.modify_other_keys_2);
+    try testing.expectEqual(@TypeOf(term.screens.active.cursor.style){}, term.screens.active.cursor.style);
+    try testing.expectEqual(.block, term.screens.active.cursor.cursor_style);
+    try testing.expect(!term.screens.active.cursor.protected);
+    try testing.expectEqual(@as(u16, 0), term.screens.active.cursor.hyperlink_id);
+    try testing.expect(term.colors.foreground.override == null);
+    try testing.expect(term.colors.background.override == null);
+    try testing.expect(term.colors.cursor.override == null);
+    try testing.expectEqual(@as(usize, 0), term.scrolling_region.top);
+    try testing.expectEqual(@as(usize, 5), term.scrolling_region.bottom);
+    try testing.expectEqual(@as(usize, 0), term.scrolling_region.left);
+    try testing.expectEqual(@as(usize, 79), term.scrolling_region.right);
+    try testing.expectEqual(.G0, term.screens.active.charset.gl);
+    try testing.expectEqual(.G2, term.screens.active.charset.gr);
+    try testing.expectEqual(.ascii, term.screens.active.charset.charsets.g0);
+}
+
+test "DECSTR alone does not leave alternate screen or reset extended input modes" {
+    const alloc = testing.allocator;
+    var term = try testCreateTerminal(alloc, testing.io, 80, 6, "");
+    defer term.deinit(alloc);
+
+    var stream = term.vtStream();
+    defer stream.deinit();
+    stream.nextSlice("\x1b[?1049h\x1b[>15u\x1b[?1003;1006;2004h\x1b[!p");
+
+    try testing.expectEqual(.alternate, term.screens.active_key);
+    try testing.expect(@as(u5, @bitCast(term.screens.active.kitty_keyboard.current())) != 0);
+    try testing.expect(term.modes.get(.mouse_event_any));
+    try testing.expect(term.modes.get(.mouse_format_sgr));
+    try testing.expect(term.modes.get(.bracketed_paste));
 }
 
 test "isUserInput: focus events excluded" {
