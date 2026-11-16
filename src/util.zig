@@ -3,7 +3,10 @@ const build_options = @import("build_options");
 const has_daemon = if (@hasDecl(build_options, "has_daemon")) build_options.has_daemon else true;
 pub const terminal = if (has_daemon) @import("terminal.zig") else struct {};
 pub const isUserInput = if (has_daemon) terminal.isUserInput else struct {};
+pub const isMouseTrackingEnabled = if (has_daemon) terminal.isMouseTrackingEnabled else struct {};
+pub const stripMouseInput = if (has_daemon) terminal.stripMouseInput else struct {};
 pub const serializeTerminalState = if (has_daemon) terminal.serializeTerminalState else struct {};
+pub const serializeTerminalStateForClient = if (has_daemon) terminal.serializeTerminalStateForClient else struct {};
 pub const serializeTerminal = if (has_daemon) terminal.serializeTerminal else struct {};
 pub const serializeTerminalRange = if (has_daemon) terminal.serializeTerminalRange else struct {};
 const ipc = @import("ipc.zig");
@@ -266,6 +269,45 @@ const DA2_QUERY = "\x1b[>c";
 const DA2_QUERY_EXPLICIT = "\x1b[>0c";
 const DA1_RESPONSE = "\x1b[?62;22c";
 const DA2_RESPONSE = "\x1b[>1;10;0c";
+
+const cleanup_keyboard =
+    "\x1b[<999u" ++ // pop kitty keyboard stack entries on the active screen
+    "\x1b[=0u" ++ // clear current kitty keyboard flags
+    "\x1b[>4;0m"; // disable xterm modifyOtherKeys
+
+/// Restores outer-terminal state when an interactive zmx client exits without
+/// sending RIS (`\x1bc`) or ED 3 (`\x1b[3J`), preserving primary scrollback.
+pub const client_cleanup =
+    "\x1b\\" ++ // close an interrupted OSC/DCS/APC/PM/SOS string cleanly
+    "\x18" ++ // CAN: cancel any remaining partial CSI/ESC sequence
+    "\x1b[?2026l" ++ // end synchronized output so cleanup renders immediately
+    cleanup_keyboard ++
+    "\x1b[?1049;1047;47l" ++ // return to primary screen if an app was in alt screen
+    cleanup_keyboard ++
+    "\x1b[?1;5;6;45;66;67;69;1045l" ++ // cursor/keypad/origin/margin/reverse modes
+    "\x1b[?9;1000;1002;1003;1004;1005;1006;1015;1016l" ++ // mouse and focus reporting
+    "\x1b[?2004;2031;2033;2048l" ++ // bracketed paste, color/cell/in-band notifications
+    "\x1b[2;4;20l\x1b[12h\x1b[?7;25h" ++ // ANSI unlock/replace/LF, wrap on, cursor visible
+    "\x1b[0m\x1b[0 q\x1b[0\"q\x1b]8;;\x1b\\" ++ // SGR, cursor style, protection, OSC 8 hyperlink
+    "\x1b]110\x1b\\\x1b]111\x1b\\\x1b]112\x1b\\" ++ // reset dynamic fg/bg/cursor color overrides
+    "\x1b(B\x1b)B\x1b*B\x1b+B\x0f\x1b}" ++ // G0-G3 ASCII and GL/GR locking shifts
+    "\x1b[r\x1b[65535;1H\r\n"; // full scroll region, bottom row without clearing, fresh line
+
+pub fn cleanupClientTerminal(fd: lib_posix.fd_t) void {
+    var remaining: []const u8 = client_cleanup;
+    while (remaining.len > 0) {
+        const n = lib_posix.write(fd, remaining) catch |err| {
+            if (err == error.WouldBlock) {
+                var fds = [_]lib_posix.pollfd{.{ .fd = fd, .events = lib_posix.POLL.OUT, .revents = 0 }};
+                _ = lib_posix.poll(&fds, 100) catch return;
+                continue;
+            }
+            return;
+        };
+        if (n == 0) return;
+        remaining = remaining[n..];
+    }
+}
 
 pub fn respondToDeviceAttributes(alloc: std.mem.Allocator, buf: *std.ArrayList(u8), data: []const u8) void {
     // Scan for DA queries in PTY output and respond on behalf of the terminal.

@@ -17,7 +17,8 @@
 
 - Persist terminal shell sessions
 - Ability to attach and detach from a shell session without it being killed
-- Native terminal scrollback
+- Non-creating `zmx resume <name>` and side-effect-free `zmx capabilities` discovery (`zmx-capabilities-v1`, `resume`, `preserve-scrollback`)
+- Native terminal scrollback preserved across client detach and cleanup
 - Multiple clients can connect to the same session
 - Re-attaching to a session restores previous terminal state and output
 - Send commands to a session without attaching to it
@@ -45,7 +46,7 @@ Full documentation is available at **[https://zmx.sh](https://zmx.sh)**:
 
 ## build
 
-Requires Zig `v0.17.0`:
+Requires Zig `v0.17.1`:
 
 ```bash
 # Build debug binary (./zig-out/bin/zmx)

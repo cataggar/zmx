@@ -1,0 +1,131 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+  id-token: write
+  attestations: write
+
+jobs:
+  build:
+    name: Build ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-24.04
+            target: x86_64-linux-musl
+            name: linux-musl-x64
+          - os: ubuntu-24.04-arm
+            target: aarch64-linux-musl
+            name: linux-musl-arm64
+          - os: ubuntu-24.04
+            target: x86_64-macos
+            name: macos-x64
+          - os: macos-15
+            target: aarch64-macos
+            name: macos-arm64
+
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Install Zig
+        shell: bash
+        run: bash .github/setup-zig.sh
+
+      - name: Ensure zstd
+        shell: bash
+        run: |
+          if ! command -v zstd >/dev/null 2>&1; then
+            if [[ "${RUNNER_OS}" == "Linux" ]]; then
+              sudo apt-get update -qq && sudo apt-get install -y zstd
+            else
+              brew install zstd
+            fi
+          fi
+          zstd --version
+
+      - name: Get version
+        id: version
+        shell: bash
+        run: echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+
+      - name: Compute SOURCE_DATE_EPOCH
+        id: sde
+        shell: bash
+        run: |
+          # Derive from the tagged commit so packaging is reproducible.
+          SDE=$(git log -1 --pretty=%ct "$GITHUB_SHA")
+          echo "value=$SDE" >> "$GITHUB_OUTPUT"
+          echo "SOURCE_DATE_EPOCH=$SDE" >> "$GITHUB_ENV"
+
+      - name: Build
+        run: zig build -Doptimize=safe -Dtarget=${{ matrix.target }} "-Dversion=${{ steps.version.outputs.version }}"
+
+      - name: Package
+        shell: bash
+        run: |
+          PKGNAME="zmx-${{ steps.version.outputs.version }}-${{ matrix.name }}"
+          mkdir -p "$PKGNAME/bin"
+          cp "zig-out/bin/zmx" "$PKGNAME/bin/"
+          cp LICENSE README.md "$PKGNAME/" 2>/dev/null || true
+          # Deterministic .tzst archive: fixed mtimes, sorted entries, fixed
+          # owner/group, Zstandard compression with windowLog <= 23 (8 MiB).
+          # SOURCE_DATE_EPOCH is set in the env from the tagged commit.
+          python3 scripts/pack.py "$PKGNAME" "$PKGNAME.tzst"
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: ${{ matrix.name }}
+          path: zmx-*.tzst
+
+  release:
+    name: Create Release
+    needs: [build]
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          merge-multiple: true
+
+      - name: Get version
+        id: version
+        run: echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+
+      - name: Verify release assets
+        shell: bash
+        run: |
+          set -euo pipefail
+          ls -la zmx-*.tzst
+          compgen -G "*.sha256" && { echo "Unexpected .sha256 sidecar" >&2; exit 1; } || true
+          compgen -G "*.sigstore.json" && { echo "Unexpected .sigstore.json sidecar" >&2; exit 1; } || true
+
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@c074443f1aee8d4aeeae555aebba3282517141b2 # v2.2.3
+        with:
+          subject-path: |
+            zmx-*.tzst
+
+      - name: Create release
+        uses: softprops/action-gh-release@da05d552573ad5aba039eaac05058a918a7bf631 # v2.2.2
+        with:
+          name: zmx ${{ steps.version.outputs.version }}
+          body: |
+            Install with [ghr](https://cataggar.github.io/ghr/):
+
+            ```sh
+            ghr install cataggar/zmx@${{ github.ref_name }}
+            ```
+          files: |
+            zmx-*.tzst
+          draft: false
+          prerelease: false
+          make_latest: true

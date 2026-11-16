@@ -37,6 +37,10 @@ pub const AttachOptions = struct {
     tracked_env: ?[]const u8 = null,
 };
 
+pub const ResumeOptions = struct {
+    tracked_env: ?[]const u8 = null,
+};
+
 pub const RunOptions = struct {
     detached: bool = false,
     cwd: ?[]const u8 = null,
@@ -119,6 +123,47 @@ pub fn connect(alloc: Allocator, io: Io, name: []const u8) !i32 {
     return socket.sessionConnect(socket_path);
 }
 
+/// Owns the already-connected descriptor, including terminal-setup failures.
+/// Both attach and resume use the same terminal restoration and client protocol.
+fn attachConnected(alloc: Allocator, client_sock: i32, env_str: []const u8) !loop.ClientResult {
+    defer lib_posix.close(client_sock);
+
+    var orig_termios: cross.termios = undefined;
+    const stdin_is_tty = cross.tcgetattr(lib_posix.STDIN_FILENO, &orig_termios) == 0;
+
+    defer {
+        if (stdin_is_tty) {
+            var no_opost = orig_termios;
+            no_opost.c_oflag &= ~@as(@TypeOf(orig_termios.c_oflag), cross.OPOST);
+            _ = cross.tcsetattr(lib_posix.STDIN_FILENO, cross.TCSAFLUSH, &no_opost);
+            // Emit while output processing is still raw (in particular, no ONLCR),
+            // then restore c_oflag with TCSANOW so exit neither blocks in ttywait
+            // on client_cleanup nor triggers BSD/XNU PENDIN on an ICANON change.
+            util.cleanupClientTerminal(lib_posix.STDOUT_FILENO);
+            if (orig_termios.c_oflag != no_opost.c_oflag) {
+                _ = cross.tcsetattr(lib_posix.STDIN_FILENO, cross.TCSANOW, &orig_termios);
+            }
+        } else {
+            util.cleanupClientTerminal(lib_posix.STDOUT_FILENO);
+        }
+    }
+
+    if (stdin_is_tty) {
+        var raw_termios = orig_termios;
+        cross.cfmakeraw(&raw_termios);
+        raw_termios.c_cc[cross.VLNEXT] = cross._POSIX_VDISABLE;
+        raw_termios.c_cc[cross.VQUIT] = cross._POSIX_VDISABLE;
+        raw_termios.c_cc[cross.VMIN] = 1;
+        raw_termios.c_cc[cross.VTIME] = 0;
+        _ = cross.tcsetattr(lib_posix.STDIN_FILENO, cross.TCSANOW, &raw_termios);
+    }
+
+    const clear_seq = "\x1b[0m\x1b[2J\x1b[H";
+    _ = try lib_posix.write(lib_posix.STDOUT_FILENO, clear_seq);
+
+    return loop.clientLoop(alloc, client_sock, env_str);
+}
+
 /// Attach the current process's stdin/stdout TTY to a session (creating if needed).
 pub fn attach(alloc: Allocator, io: Io, name: []const u8, opts: AttachOptions) !void {
     signal.ignoreSigpipe();
@@ -139,68 +184,103 @@ pub fn attach(alloc: Allocator, io: Io, name: []const u8, opts: AttachOptions) !
         return;
     }
 
-    const sesh = try socket.getSeshName(alloc, name);
-    defer alloc.free(sesh);
+    var cfg = try Cfg.init(alloc, io);
+    defer cfg.deinit(alloc);
+
+    const env_str = opts.tracked_env orelse "";
+    var cur_opts = opts;
+    var current_sesh = try socket.getSeshName(alloc, name);
+    defer alloc.free(current_sesh);
+    var switched_cwd: ?[]const u8 = null;
+    defer if (switched_cwd) |c| alloc.free(c);
+
+    while (true) {
+        try socket.validateSeshName(current_sesh);
+        const socket_path = try socket.getSocketPath(alloc, cfg.socket_dir, current_sesh);
+        defer alloc.free(socket_path);
+
+        if (has_daemon) {
+            var daemon = Daemon.init(io, &cfg, current_sesh, socket_path);
+            daemon.command = cur_opts.command;
+            if (cur_opts.cwd) |cwd| daemon.setCwd(cwd);
+            if (cur_opts.shell) |sh| daemon.shell = sh;
+            const is_daemon_proc = try daemon.ensureSession(io);
+            if (is_daemon_proc) std.process.exit(0);
+        }
+
+        if (cur_opts.labels) |kvs| {
+            try set(alloc, io, current_sesh, kvs);
+        }
+
+        const client_sock = try socket.sessionConnect(socket_path);
+        const looper = try attachConnected(alloc, client_sock, env_str);
+        defer {
+            if (looper.session_name) |sn| alloc.free(sn);
+            if (looper.cwd) |c| alloc.free(c);
+        }
+
+        switch (looper.kind) {
+            .detach, .unavailable => return,
+            .switch_session => {
+                // Switch payloads already include ZMX_SESSION_PREFIX; validate
+                // without re-applying getSeshName.
+                const target_name = looper.session_name orelse return;
+                try socket.validateSeshName(target_name);
+                const next_sesh = try alloc.dupe(u8, target_name);
+                alloc.free(current_sesh);
+                current_sesh = next_sesh;
+
+                cur_opts.labels = null;
+                cur_opts.command = null;
+                if (looper.cwd) |new_cwd| {
+                    const dup_cwd = try alloc.dupe(u8, new_cwd);
+                    if (switched_cwd) |old_cwd| alloc.free(old_cwd);
+                    switched_cwd = dup_cwd;
+                    cur_opts.cwd = dup_cwd;
+                }
+            },
+        }
+    }
+}
+
+/// Resume an existing session without creating a daemon or deleting stale sockets.
+pub fn resumeSession(alloc: Allocator, io: Io, name: []const u8, opts: ResumeOptions) !void {
+    signal.ignoreSigpipe();
+    if (socket.getSeshNameFromEnv().len > 0) {
+        return error.NestedSession;
+    }
 
     var cfg = try Cfg.init(alloc, io);
     defer cfg.deinit(alloc);
 
-    const socket_path = try socket.getSocketPath(alloc, cfg.socket_dir, sesh);
-    defer alloc.free(socket_path);
-
-    if (has_daemon) {
-        var daemon = Daemon.init(io, &cfg, sesh, socket_path);
-        daemon.command = opts.command;
-        if (opts.cwd) |cwd| daemon.setCwd(cwd);
-        if (opts.shell) |sh| daemon.shell = sh;
-        const is_daemon_proc = try daemon.ensureSession(io);
-        if (is_daemon_proc) std.process.exit(0);
-    }
-
-    if (opts.labels) |kvs| {
-        try set(alloc, io, sesh, kvs);
-    }
-
-    const client_sock = try socket.sessionConnect(socket_path);
-
-    var orig_termios: cross.termios = undefined;
-    const stdin_is_tty = cross.tcgetattr(lib_posix.STDIN_FILENO, &orig_termios) == 0;
-    const restore_seq = "\x1bc\x1b]110\x1b\\\x1b]111\x1b\\\x1b]112\x1b\\";
-
-    defer {
-        if (stdin_is_tty) {
-            _ = cross.tcsetattr(lib_posix.STDIN_FILENO, cross.TCSAFLUSH, &orig_termios);
-        }
-        _ = lib_posix.write(lib_posix.STDOUT_FILENO, restore_seq) catch {};
-    }
-
-    if (stdin_is_tty) {
-        var raw_termios = orig_termios;
-        cross.cfmakeraw(&raw_termios);
-        raw_termios.c_cc[cross.VLNEXT] = cross._POSIX_VDISABLE;
-        raw_termios.c_cc[cross.VQUIT] = cross._POSIX_VDISABLE;
-        raw_termios.c_cc[cross.VMIN] = 1;
-        raw_termios.c_cc[cross.VTIME] = 0;
-        _ = cross.tcsetattr(lib_posix.STDIN_FILENO, cross.TCSANOW, &raw_termios);
-    }
-
-    const clear_seq = "\x1b[0m\x1b[2J\x1b[H";
-    _ = try lib_posix.write(lib_posix.STDOUT_FILENO, clear_seq);
-
     const env_str = opts.tracked_env orelse "";
-    const looper = try loop.clientLoop(client_sock, env_str);
-    switch (looper.kind) {
-        .detach => return,
-        .switch_session => {
-            if (looper.session_name) |target_name| {
-                _ = lib_posix.write(lib_posix.STDOUT_FILENO, restore_seq) catch {};
-                var new_opts = opts;
-                new_opts.labels = null;
-                new_opts.command = null;
-                if (looper.cwd) |new_cwd| new_opts.cwd = new_cwd;
-                return attach(alloc, io, target_name, new_opts);
-            }
-        },
+    var current_sesh = try socket.getSeshName(alloc, name);
+    defer alloc.free(current_sesh);
+
+    while (true) {
+        // Switch payloads already include the prefix. Validate without adding
+        // it again, and never reenter attach/ensureSession from this loop.
+        try socket.validateSeshName(current_sesh);
+        const socket_path = try socket.getSocketPath(alloc, cfg.socket_dir, current_sesh);
+        defer alloc.free(socket_path);
+        const client_sock = try socket.sessionConnect(socket_path);
+        const looper = try attachConnected(alloc, client_sock, env_str);
+        defer {
+            if (looper.session_name) |sn| alloc.free(sn);
+            if (looper.cwd) |c| alloc.free(c);
+        }
+
+        switch (looper.kind) {
+            .detach => return,
+            .unavailable => return error.SessionUnavailable,
+            .switch_session => {
+                const target_name = looper.session_name orelse return;
+                try socket.validateSeshName(target_name);
+                const next_sesh = try alloc.dupe(u8, target_name);
+                alloc.free(current_sesh);
+                current_sesh = next_sesh;
+            },
+        }
     }
 }
 

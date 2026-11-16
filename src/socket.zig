@@ -15,6 +15,13 @@ pub fn getSeshName(alloc: std.mem.Allocator, sesh: []const u8) ![]const u8 {
         return error.SessionNameRequired;
     }
     const full = try std.fmt.allocPrint(alloc, "{s}{s}", .{ prefix, sesh });
+    errdefer alloc.free(full);
+    try validateSeshName(full);
+    return full;
+}
+
+pub fn validateSeshName(full: []const u8) !void {
+    if (full.len == 0) return error.SessionNameRequired;
     // Session names become filenames under socket_dir. Rejecting path
     // separators and dot-dot prevents socket creation and stale-socket
     // deletion from operating outside that directory.
@@ -22,10 +29,16 @@ pub fn getSeshName(alloc: std.mem.Allocator, sesh: []const u8) ![]const u8 {
         std.mem.indexOfScalar(u8, full, 0) != null or
         std.mem.eql(u8, full, ".") or std.mem.eql(u8, full, ".."))
     {
-        alloc.free(full);
         return error.InvalidSessionName;
     }
-    return full;
+}
+
+test "validateSeshName accepts full switch names without applying a prefix" {
+    try validateSeshName("p.work");
+    try std.testing.expectError(error.SessionNameRequired, validateSeshName(""));
+    for ([_][]const u8{ ".", "..", "../work", "work/other", "work\x00other" }) |name| {
+        try std.testing.expectError(error.InvalidSessionName, validateSeshName(name));
+    }
 }
 
 pub fn resolveSessionOrEnv(alloc: std.mem.Allocator, io: std.Io, session_name: ?[]const u8) ![]const u8 {
@@ -34,7 +47,7 @@ pub fn resolveSessionOrEnv(alloc: std.mem.Allocator, io: std.Io, session_name: ?
         if (std.mem.eql(u8, name, ".")) blk: {
             if (sesh_env.len > 0) break :blk sesh_env;
             var buf: [4096]u8 = undefined;
-            var w = std.Io.File.stderr().writer(io, &buf);
+            var w = std.Io.File.stderr().writerStreaming(io, &buf);
             w.interface.print("error: \".\" requires ZMX_SESSION (are you inside a zmx session?)\n", .{}) catch {};
             w.interface.flush() catch {};
             return error.SessionNameRequired;
@@ -139,7 +152,7 @@ pub fn getSocketPath(
 
 pub fn printSessionNameTooLong(io: std.Io, session_name: []const u8, socket_dir: []const u8) noreturn {
     var buf: [4096]u8 = undefined;
-    var w = std.Io.File.stderr().writer(io, &buf);
+    var w = std.Io.File.stderr().writerStreaming(io, &buf);
     if (maxSessionNameLen(socket_dir)) |max_len| {
         w.interface.print(
             "error: session name is too long ({d} bytes, max {d} for socket directory \"{s}\")\n",

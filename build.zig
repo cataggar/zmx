@@ -2,14 +2,16 @@ const std = @import("std");
 const Translator = @import("translate_c").Translator;
 const build_zig_zon = @import("build.zig.zon");
 
-const linux_targets: []const std.Target.Query = &.{
-    .{ .cpu_arch = .x86_64, .os_tag = .linux, .abi = .musl },
-    .{ .cpu_arch = .aarch64, .os_tag = .linux, .abi = .musl },
+const ReleaseTarget = struct {
+    query: std.Target.Query,
+    name: []const u8,
 };
 
-const macos_targets: []const std.Target.Query = &.{
-    .{ .cpu_arch = .x86_64, .os_tag = .macos },
-    .{ .cpu_arch = .aarch64, .os_tag = .macos },
+const release_targets: []const ReleaseTarget = &.{
+    .{ .query = .{ .cpu_arch = .x86_64, .os_tag = .linux, .abi = .musl }, .name = "linux-musl-x64" },
+    .{ .query = .{ .cpu_arch = .aarch64, .os_tag = .linux, .abi = .musl }, .name = "linux-musl-arm64" },
+    .{ .query = .{ .cpu_arch = .x86_64, .os_tag = .macos }, .name = "macos-x64" },
+    .{ .query = .{ .cpu_arch = .aarch64, .os_tag = .macos }, .name = "macos-arm64" },
 };
 
 pub fn build(b: *std.Build) void {
@@ -188,15 +190,14 @@ pub fn build(b: *std.Build) void {
         }
     }
 
-    // Release step - cross-compile to all targets from any host
+    // Release step - cross-compile .tzst archives for all targets from any host
     {
         const release_step = b.step(
             "release",
-            "Build release binaries for all platforms",
+            "Build .tzst release archives for all platforms",
         );
-        const release_targets = linux_targets ++ macos_targets;
         for (release_targets) |release_target| {
-            const resolved = b.resolveTargetQuery(release_target);
+            const resolved = b.resolveTargetQuery(release_target.query);
             const release_translator: Translator = .init(translate_c, .{
                 .c_source_file = b.path("src/c.h"),
                 .target = resolved,
@@ -226,36 +227,28 @@ pub fn build(b: *std.Build) void {
                 release_mod.addImport("ghostty-vt", release_dep.module("ghostty-vt"));
             }
 
-            // const is_local_macos = resolved.result.os.tag == .macos;
             const release_exe = b.addExecutable(.{
                 .name = "zmx",
-                // .use_llvm = true,
-                // .use_lld = !is_local_macos,
                 .root_module = release_mod,
             });
 
-            const os_name = @tagName(release_target.os_tag orelse .linux);
-            const arch_name = @tagName(release_target.cpu_arch orelse .x86_64);
-            const tarball_name = b.fmt("zmx-{s}-{s}-{s}.tar.gz", .{ version, os_name, arch_name });
+            const pkg_name = b.fmt("zmx-{s}-{s}", .{ version, release_target.name });
+            const archive_name = b.fmt("{s}.tzst", .{pkg_name});
 
-            const tar = b.addSystemCommand(&.{ "tar", "-czf" });
+            const stage = b.addWriteFiles();
+            _ = stage.addCopyFile(release_exe.getEmittedBin(), "bin/zmx");
+            _ = stage.addCopyFile(b.path("LICENSE"), "LICENSE");
+            _ = stage.addCopyFile(b.path("README.md"), "README.md");
 
-            const tarball = tar.addOutputFileArg(tarball_name);
-            tar.addArg("-C");
-            tar.addDirectoryArg(release_exe.getEmittedBinDirectory());
-            tar.addArg("zmx");
+            const pack = b.addSystemCommand(&.{"python3"});
+            pack.setEnvironmentVariable("SOURCE_DATE_EPOCH", "0");
+            pack.addFileArg(b.path("scripts/pack.py"));
+            pack.addArgs(&.{ "--root", pkg_name });
+            pack.addDirectoryArg(stage.getDirectory());
+            const archive = pack.addOutputFileArg(archive_name);
 
-            const shasum = b.addSystemCommand(&.{"sha256sum"});
-            shasum.addFileArg(tarball);
-            const shasum_output = shasum.captureStdOut(.{});
-
-            const install_tar = b.addInstallFile(tarball, b.fmt("dist/{s}", .{tarball_name}));
-            const install_sha = b.addInstallFile(
-                shasum_output,
-                b.fmt("dist/{s}.sha256", .{tarball_name}),
-            );
-            release_step.dependOn(&install_tar.step);
-            release_step.dependOn(&install_sha.step);
+            const install_archive = b.addInstallFile(archive, b.fmt("dist/{s}", .{archive_name}));
+            release_step.dependOn(&install_archive.step);
         }
     }
 }

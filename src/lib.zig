@@ -16,12 +16,14 @@ pub const SessionEntry = util.SessionEntry;
 
 pub const CreateOptions = client.CreateOptions;
 pub const AttachOptions = client.AttachOptions;
+pub const ResumeOptions = client.ResumeOptions;
 pub const RunOptions = client.RunOptions;
 pub const KillOptions = client.KillOptions;
 pub const KillStatus = client.KillStatus;
 
 pub const connect = client.connect;
 pub const attach = client.attach;
+pub const resumeSession = client.resumeSession;
 pub const detach = client.detach;
 pub const list = client.list;
 pub const kill = client.kill;

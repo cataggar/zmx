@@ -97,6 +97,15 @@ pub const PtyInfo = struct {
 /// This is the second fork in the double-fork technique explained in the
 /// daemonize() comment.
 pub fn spawnPty(sesh_name: []const u8, cmd: Cmd, size: ipc.Resize) !PtyInfo {
+    // An inherited SIG_IGN/SA_NOCLDWAIT would auto-reap the child and permit
+    // PID reuse during final output draining.
+    const child_action: lib_posix.Sigaction = .{
+        .handler = .{ .handler = lib_posix.SIG.DFL },
+        .mask = lib_posix.sigemptyset(),
+        .flags = 0,
+    };
+    lib_posix.sigaction(lib_posix.SIG.CHLD, &child_action, null);
+
     var ws: cross.struct_winsize = .{
         .ws_row = size.rows,
         .ws_col = size.cols,
@@ -122,6 +131,13 @@ pub fn spawnPty(sesh_name: []const u8, cmd: Cmd, size: ipc.Resize) !PtyInfo {
         unreachable; // exec() either execs or exits, never returns ok
     }
     // master pid code path
+    errdefer {
+        lib_posix.kill(-pid, lib_posix.SIG.HUP) catch {};
+        lib_posix.kill(-pid, lib_posix.SIG.KILL) catch {};
+        var status: c_int = 0;
+        _ = std.c.waitpid(pid, &status, 0);
+        lib_posix.close(master_fd);
+    }
     std.log.info("pty spawned session={s} pid={d}", .{ sesh_name, pid });
 
     // make pty non-blocking

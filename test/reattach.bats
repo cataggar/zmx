@@ -13,7 +13,11 @@ sock_dir, name, rows, cols, hold = sys.argv[1], sys.argv[2], int(sys.argv[3]), i
 s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
 s.connect(os.path.join(sock_dir, name))
 payload = struct.pack("<HHHH", rows, cols, 0, 0)            # ipc.Resize
-s.sendall(struct.pack("<BBHI", 7, 1, 0, len(payload)) + payload)  # ipc.Header (tag=7, ver=1, res=0, len)
+s.sendall(
+    struct.pack("<BBHI", 23, 1, 0, 0)                       # ipc.Attach
+    + struct.pack("<BBHI", 7, 1, 0, len(payload)) + payload # ipc.Init
+    + struct.pack("<BBHI", 6, 1, 0, 0)                      # ipc.Info
+)
 time.sleep(hold)
 s.close()
 PY
@@ -74,7 +78,19 @@ count() { "$ZMX" history "$1" | grep -o "$2" | wc -l | tr -d ' '; }
 import fcntl, os, pty, select, signal, struct, subprocess, sys, tempfile, termios, time
 
 zmx = sys.argv[1]
-restore = b"\x1bc\x1b]110\x1b\\\x1b]111\x1b\\\x1b]112\x1b\\"
+cleanup_keyboard = b"\x1b[<999u\x1b[=0u\x1b[>4;0m"
+restore = (
+    b"\x1b\\\x18\x1b[?2026l" + cleanup_keyboard +
+    b"\x1b[?1049;1047;47l" + cleanup_keyboard +
+    b"\x1b[?1;5;6;45;66;67;69;1045l"
+    b"\x1b[?9;1000;1002;1003;1004;1005;1006;1015;1016l"
+    b"\x1b[?2004;2031;2033;2048l"
+    b"\x1b[2;4;20l\x1b[12h\x1b[?7;25h"
+    b"\x1b[0m\x1b[0 q\x1b[0\"q\x1b]8;;\x1b\\"
+    b"\x1b]110\x1b\\\x1b]111\x1b\\\x1b]112\x1b\\"
+    b"\x1b(B\x1b)B\x1b*B\x1b+B\x0f\x1b}"
+    b"\x1b[r\x1b[65535;1H\r\n"
+)
 with tempfile.TemporaryDirectory(prefix="zmx-signal-", dir="/tmp") as socket_dir:
     env = {k: v for k, v in os.environ.items() if not k.startswith("ZMX_")}
     env.update(ZMX_DIR=socket_dir, SHELL="/bin/sh", TERM="xterm-256color")
@@ -112,7 +128,8 @@ with tempfile.TemporaryDirectory(prefix="zmx-signal-", dir="/tmp") as socket_dir
             assert termios.tcgetattr(slave) == original, sig
             while select.select([master], [], [], 0)[0]:
                 output.extend(os.read(master, 65536))
-            assert restore in output, sig
+            assert output.endswith(restore), (sig, output)
+            assert b"\x1bc" not in output, sig
             sessions = subprocess.check_output(
                 [zmx, "list", "--short"], env=env, text=True, timeout=5,
             )
